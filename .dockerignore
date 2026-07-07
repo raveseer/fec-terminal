@@ -1,0 +1,12 @@
+node_modules
+dist
+.git
+# never bake the SQLite cache or secrets into image layers; data/ also busts
+# the COPY layer cache on every build
+data
+.env
+# backups, editor/vite droppings
+.bak-*
+*.timestamp-*.mjs
+.DS_Store
+*.log

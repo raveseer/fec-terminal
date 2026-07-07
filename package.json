@@ -1,0 +1,25 @@
+{
+  "name": "fec-terminal",
+  "version": "4.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "start": "node server/index.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@highcharts/map-collection": "^2.3.3",
+    "@vitejs/plugin-react": "^4.3.1",
+    "react-simple-maps": "^3.0.0",
+    "topojson": "^3.0.2",
+    "topojson-client": "^3.1.0",
+    "us-atlas": "^3.0.1",
+    "vite": "^5.4.8"
+  }
+}
