@@ -118,6 +118,9 @@ try {
     CREATE INDEX IF NOT EXISTS idx_contrib_donor ON contributions(donor_key, kind);
     CREATE INDEX IF NOT EXISTS idx_contrib_recip ON contributions(recipient_id, cycle);
     CREATE INDEX IF NOT EXISTS idx_contrib_name ON contributions(donor_name);
+    CREATE INDEX IF NOT EXISTS idx_contrib_cand ON contributions(candidate_id);
+    CREATE INDEX IF NOT EXISTS idx_contrib_employer ON contributions(employer);
+    CREATE INDEX IF NOT EXISTS idx_contrib_occupation ON contributions(occupation);
     CREATE TABLE IF NOT EXISTS donor_watch (
       donor_key    TEXT PRIMARY KEY,
       display_name TEXT NOT NULL,
@@ -595,6 +598,114 @@ export function contribRecipientRows(recipientId, cycle = "", { kind = "contribu
   return [...memContrib.values()].filter((v) => String(v.recipientId) === String(recipientId)
     && (v.kind || "contribution") === kind && (!cycle || String(v.cycle) === String(cycle)))
     .sort((a, b) => b.amount - a.amount).slice(0, limit);
+}
+
+// Slim edge rows for overlap/graph aggregation — filter by recipient/candidate ids and/or donor
+// keys and kind, aggregation happens in index.js. Memo rows are excluded up front (FEC accounting
+// rule: memo entries never count toward totals — earmark details/conduit batch lines double-count).
+// recipientIds match recipient_id OR candidate_id, uppercased, so committee and candidate ids both work.
+export function contribEdgeRows({ recipientIds = null, donorKeys = null, kind = null, limit = 20000 } = {}) {
+  const rids = recipientIds ? [...new Set(recipientIds.map((s) => String(s).toUpperCase().trim()).filter(Boolean))] : null;
+  const dks = donorKeys ? [...new Set(donorKeys.map((s) => String(s)).filter(Boolean))] : null;
+  if (!rids?.length && !dks?.length) return [];
+  if (db) {
+    try {
+      const conds = ["memo = 0"];
+      const args = [];
+      if (kind) { conds.push("kind = ?"); args.push(kind); }
+      if (rids?.length) {
+        const ph = rids.map(() => "?").join(",");
+        conds.push(`(UPPER(recipient_id) IN (${ph}) OR UPPER(candidate_id) IN (${ph}))`);
+        args.push(...rids, ...rids);
+      }
+      if (dks?.length) {
+        conds.push(`donor_key IN (${dks.map(() => "?").join(",")})`);
+        args.push(...dks);
+      }
+      return db.prepare(`
+        SELECT source, kind, donor_key AS donorKey, donor_name AS donorName, employer, occupation,
+               city, state, entity_type AS entityType, recipient_id AS recipientId,
+               recipient_name AS recipientName, candidate_id AS candidateId, cycle, date, amount, report
+        FROM contributions WHERE ${conds.join(" AND ")} LIMIT ?
+      `).all(...args, limit);
+    } catch { return []; }
+  }
+  const ridSet = rids ? new Set(rids) : null;
+  const dkSet = dks ? new Set(dks) : null;
+  const out = [];
+  for (const v of memContrib.values()) {
+    if (v.memo) continue;
+    if (kind && (v.kind || "contribution") !== kind) continue;
+    if (ridSet && !ridSet.has(String(v.recipientId || "").toUpperCase()) && !ridSet.has(String(v.candidateId || "").toUpperCase())) continue;
+    if (dkSet && !dkSet.has(v.donorKey)) continue;
+    out.push({ ...v, kind: v.kind || "contribution" });
+    if (out.length >= limit) break;
+  }
+  return out;
+}
+
+// Aggregations for the employer/occupation reverse lookup: totals, per-recipient rollup,
+// per-donor rollup, and the raw field-value variants (so the UI can show fragmentation like
+// "FEDEX" / "FEDEX CORP" / "FEDEX EXPRESS"). LIKE-substring match, contributions only, memo excluded.
+export function contribFieldAgg({ q = "", field = "employer", state = "", limit = 200 } = {}) {
+  const col = field === "occupation" ? "occupation" : "employer";
+  const empty = { totals: { total: 0, count: 0, donors: 0, recipients: 0 }, recipients: [], donors: [], variants: [] };
+  const needle = String(q).toUpperCase().trim();
+  if (!needle) return empty;
+  if (db) {
+    try {
+      const conds = ["kind = 'contribution'", "memo = 0", `UPPER(${col}) LIKE ?`];
+      const args = [`%${needle}%`];
+      if (state) { conds.push("UPPER(state) = ?"); args.push(String(state).toUpperCase()); }
+      const where = conds.join(" AND ");
+      const totals = db.prepare(`
+        SELECT COALESCE(SUM(amount),0) AS total, COUNT(*) AS count,
+               COUNT(DISTINCT donor_key) AS donors, COUNT(DISTINCT recipient_id) AS recipients
+        FROM contributions WHERE ${where}`).get(...args);
+      const recipients = db.prepare(`
+        SELECT recipient_id AS recipientId, MAX(recipient_name) AS recipientName, MAX(source) AS source,
+               SUM(amount) AS total, COUNT(*) AS count, COUNT(DISTINCT donor_key) AS donors,
+               MIN(NULLIF(date,'')) AS firstDate, MAX(date) AS lastDate
+        FROM contributions WHERE ${where} GROUP BY recipient_id ORDER BY total DESC LIMIT ?`).all(...args, limit);
+      const donors = db.prepare(`
+        SELECT donor_key AS donorKey, MAX(donor_name) AS name, MAX(employer) AS employer,
+               MAX(occupation) AS occupation, MAX(city) AS city, MAX(state) AS state,
+               SUM(amount) AS total, COUNT(*) AS count, COUNT(DISTINCT recipient_id) AS recipients
+        FROM contributions WHERE ${where} GROUP BY donor_key ORDER BY total DESC LIMIT ?`).all(...args, limit);
+      const variants = db.prepare(`
+        SELECT ${col} AS value, SUM(amount) AS total, COUNT(*) AS count
+        FROM contributions WHERE ${where} GROUP BY ${col} ORDER BY total DESC LIMIT ?`).all(...args, limit);
+      return { totals, recipients, donors, variants };
+    } catch { return empty; }
+  }
+  const recipM = new Map(), donorM = new Map(), varM = new Map();
+  const t = { total: 0, count: 0, _d: new Set(), _r: new Set() };
+  for (const v of memContrib.values()) {
+    if (v.memo || (v.kind && v.kind !== "contribution")) continue;
+    const val = String(v[col] || "").toUpperCase();
+    if (!val.includes(needle)) continue;
+    if (state && String(v.state || "").toUpperCase() !== String(state).toUpperCase()) continue;
+    const amt = Number(v.amount) || 0;
+    t.total += amt; t.count++; t._d.add(v.donorKey); t._r.add(v.recipientId);
+    const r = recipM.get(v.recipientId) || { recipientId: v.recipientId, recipientName: v.recipientName, source: v.source, total: 0, count: 0, _d: new Set(), firstDate: null, lastDate: null };
+    r.total += amt; r.count++; r._d.add(v.donorKey);
+    if (v.date) { if (!r.firstDate || v.date < r.firstDate) r.firstDate = v.date; if (!r.lastDate || v.date > r.lastDate) r.lastDate = v.date; }
+    recipM.set(v.recipientId, r);
+    const d = donorM.get(v.donorKey) || { donorKey: v.donorKey, name: v.donorName, employer: v.employer, occupation: v.occupation, city: v.city, state: v.state, total: 0, count: 0, _r: new Set() };
+    d.total += amt; d.count++; d._r.add(v.recipientId);
+    donorM.set(v.donorKey, d);
+    const vk = v[col] || "";
+    const vv = varM.get(vk) || { value: vk, total: 0, count: 0 };
+    vv.total += amt; vv.count++;
+    varM.set(vk, vv);
+  }
+  const top = (m, fix) => [...m.values()].map(fix).sort((a, b) => b.total - a.total).slice(0, limit);
+  return {
+    totals: { total: t.total, count: t.count, donors: t._d.size, recipients: t._r.size },
+    recipients: top(recipM, (r) => ({ ...r, donors: r._d.size, _d: undefined })),
+    donors: top(donorM, (d) => ({ ...d, recipients: d._r.size, _r: undefined })),
+    variants: top(varM, (v) => v),
+  };
 }
 
 export function contribStats() {

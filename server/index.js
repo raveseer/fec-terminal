@@ -10,7 +10,7 @@ import { cacheGet, cacheSet, cacheGetWithAge, cacheCount, cacheFlush, settingGet
          aiSummaryGet, aiSummarySave, aiSummaryCount, aiSummaryClear,
          tnSearchSave, tnSearchList,
          contribUpsertMany, contribDeleteBySubIdPrefix, contribDonorGroups, contribDonorNamePool, contribDonorRows,
-         contribRecipientRows, contribStats,
+         contribRecipientRows, contribStats, contribEdgeRows, contribFieldAgg,
          watchAdd, watchRemove, watchHas, watchList, watchMarkSeen, probeGet, probeSet } from "./db.js";
 import { webSearch, searchConfigured, searchProvider } from "./search.js";
 import { looksLikeNonAnswer, cleanAnswer, usableAnswerOrEmpty } from "./deferral.js";
@@ -685,6 +685,773 @@ app.post("/api/donors/watchlist/refresh", fecLimiter, async (_req, res) => {
 
 app.get("/api/donors/stats", (_req, res) => res.json(contribStats()));
 
+// ============================================================================
+//  Who-funds-who tools — donor overlap, employer/occupation reverse lookup,
+//  and the money-flow graph. All read the permanent contributions ledger and
+//  (probe-gated) top up from the FEC first so a cold store still answers.
+// ============================================================================
+
+// Conduit pass-throughs (WinRed/ActBlue etc.) look like a "shared donor" of literally every
+// candidate on their platform — always split them out of overlap/graph aggregates.
+const FLOW_CONDUIT_RE = /^(WINRED|ACTBLUE|ACT BLUE|DEMOCRACY ENGINE|ANEDOT)\b/;
+
+// Committee-ish donors (PACs, parties, other committees) get flagged so the UI can badge
+// org money differently from individuals. FEC entity_type: IND/CAN/CCM/COM/ORG/PAC/PTY.
+const ORG_ENTITY_RE = /^(CCM|COM|ORG|PAC|PTY)$/i;
+
+// Probe-gated top-up pull of a committee's biggest itemized receipts (and optionally
+// disbursements) so ledger-backed views work without the user having opened the donor
+// ledger for that committee first. Best-effort: errors are collected, never thrown.
+async function topUpCommittee(committeeId, cycle, { disbursements = false, fresh = false } = {}) {
+  const errors = [];
+  const jobs = [["schedules/schedule_a/", "-contribution_receipt_amount", ingestScheduleA, "a"]];
+  if (disbursements) jobs.push(["schedules/schedule_b/", "-disbursement_amount", ingestScheduleB, "b"]);
+  for (const [fecPath, sort, ingest, tag] of jobs) {
+    const probeKey = `fec:topup:${tag}:${committeeId}:${cycle || "all"}`;
+    if (!fresh) {
+      const probe = probeGet(probeKey);
+      if (probe && Date.now() - probe.checkedAt < DONOR_PROBE_FRESH_MS) continue;
+    }
+    try {
+      const params = { committee_id: committeeId, sort, per_page: "100" };
+      if (cycle) params.two_year_transaction_period = String(cycle);
+      const d = await fecFetch(fecPath, params);
+      ingest(d.results);
+      probeSet(probeKey, String(d.pagination?.count ?? 0));
+    } catch (e) { errors.push(`${committeeId}: ${e.message}`); }
+  }
+  return errors;
+}
+
+// Shared donors across 2-6 candidates/committees — the "who funds both X and Y" question.
+// mode="vendors" flips the pivot to disbursements (donor_key = payee): campaigns quietly using
+// the same consultants/media firms is a classic coordination tell.
+// Reads the stored ledger (memo rows excluded at the accessor); pull=1 tops up each target's
+// top-100 receipts (and disbursements, in vendors mode) from the FEC first (probe-gated daily).
+app.post("/api/donors/overlap", fecLimiter, async (req, res) => {
+  const targetsIn = Array.isArray(req.body?.targets) ? req.body.targets.slice(0, 6) : [];
+  const cycle = String(req.body?.cycle || "").trim(); // "" = all stored cycles
+  const pull = req.body?.pull !== false;
+  const mode = req.body?.mode === "vendors" ? "vendors" : "donors";
+  const rowKind = mode === "vendors" ? "disbursement" : "contribution";
+  const targets = targetsIn.map((t) => ({
+    name: String(t?.name || "").trim() || "—",
+    ids: [...new Set([t?.candidateId, t?.committeeId, ...(Array.isArray(t?.committeeIds) ? t.committeeIds : [])]
+      .map((s) => String(s || "").toUpperCase().trim()).filter(Boolean))],
+  })).filter((t) => t.ids.length);
+  if (targets.length < 2) {
+    return res.status(400).json({ error: { message: "Pick at least two candidates — each needs a committee or candidate id." } });
+  }
+
+  const errors = [];
+  if (pull) {
+    for (const t of targets) {
+      const cid = t.ids.find((id) => /^C\d{4,}$/.test(id));
+      if (cid) errors.push(...await topUpCommittee(cid, cycle, { disbursements: mode === "vendors" }));
+    }
+  }
+
+  // id → target index (a donor row matches a target when its recipient_id OR candidate_id is one of the target's ids)
+  const idToTarget = new Map();
+  targets.forEach((t, i) => t.ids.forEach((id) => idToTarget.set(id, i)));
+  const rows = contribEdgeRows({ recipientIds: [...idToTarget.keys()], kind: rowKind });
+
+  const groups = new Map();
+  let conduitSkipped = 0;
+  for (const r of rows) {
+    if (cycle && r.cycle && String(r.cycle) !== cycle) continue;
+    const ti = idToTarget.get(String(r.recipientId || "").toUpperCase()) ?? idToTarget.get(String(r.candidateId || "").toUpperCase());
+    if (ti == null) continue;
+    if (FLOW_CONDUIT_RE.test(String(r.donorKey || ""))) { conduitSkipped++; continue; }
+    const g = groups.get(r.donorKey) || {
+      donorKey: r.donorKey, name: r.donorName, employer: r.employer, occupation: r.occupation,
+      city: r.city, state: r.state, entityType: r.entityType, total: 0, count: 0,
+      per: targets.map(() => ({ total: 0, count: 0 })),
+    };
+    if (!g.name && r.donorName) g.name = r.donorName;
+    if (!g.employer && r.employer) g.employer = r.employer;
+    if (!g.occupation && r.occupation) g.occupation = r.occupation;
+    if (!g.entityType && r.entityType) g.entityType = r.entityType;
+    const amt = Number(r.amount) || 0;
+    g.per[ti].total += amt; g.per[ti].count++;
+    g.total += amt; g.count++;
+    groups.set(r.donorKey, g);
+  }
+
+  const all = [...groups.values()];
+  const perTargetDonors = targets.map((_, i) => all.filter((g) => g.per[i].count > 0).length);
+  const shared = all
+    .map((g) => ({ ...g, targetsHit: g.per.filter((p) => p.count > 0).length, org: ORG_ENTITY_RE.test(g.entityType || "") }))
+    .filter((g) => g.targetsHit >= 2)
+    .sort((a, b) => b.targetsHit - a.targetsHit || b.total - a.total)
+    .slice(0, 300)
+    .map((g) => ({ ...g, watched: watchHas(g.donorKey) }));
+
+  res.json({
+    mode,
+    targets: targets.map((t, i) => ({ name: t.name, ids: t.ids, donors: perTargetDonors[i] })),
+    donors: shared, sharedCount: shared.length, cycle: cycle || "all",
+    coverage: `Overlap reads this app's stored ledger — itemized rows already pulled (top-100 per committee per top-up), not the FEC's complete file. ${mode === "vendors" ? "Open each candidate's Flows and hit ⤢ Trace FEC" : "Open each candidate's Donors ledger and page deeper"} to widen coverage.`,
+    ...(conduitSkipped ? { conduitNote: `${conduitSkipped} conduit rows (WinRed / ActBlue / etc.) excluded — ${mode === "vendors" ? "processing fees hit every campaign" : "they'd falsely 'overlap' every candidate on the platform"}.` } : {}),
+    ...(errors.length ? { note: errors.join("; ") } : {}),
+  });
+});
+
+// ---- employer / occupation reverse lookup ----
+
+// Canonicalize employer strings for the variants rollup: the FEC file is full of
+// "SELF" / "SELF-EMPLOYED" / "SELF EMPLOYED" fragmentation, and suffix noise (INC/LLC/CORP).
+function normalizeEmployerName(v) {
+  let s = String(v || "").toUpperCase().replace(/[^A-Z0-9& ]/g, " ").replace(/\s+/g, " ").trim();
+  if (!s) return "(blank)";
+  if (/^(SELF|SELF EMPLOYED|SELFEMPLOYED|SELF EMP(LOYED)?|OWNER OPERATOR)$/.test(s)) return "SELF-EMPLOYED";
+  if (/^(NONE|NOT EMPLOYED|UNEMPLOYED|N A|NA|NOT APPLICABLE|NO EMPLOYER)$/.test(s)) return "NOT EMPLOYED";
+  if (/^(RETIRED|RETIREE|RETIRED RETIRED)$/.test(s)) return "RETIRED";
+  if (/^(HOMEMAKER|HOUSEWIFE|HOMEMAKER HOMEMAKER)$/.test(s)) return "HOMEMAKER";
+  if (/^(STUDENT)$/.test(s)) return "STUDENT";
+  // strip trailing corporate suffixes (repeat for "X CO INC" style doubles)
+  for (let i = 0; i < 2; i++) s = s.replace(/\s+(INCORPORATED|INC|LLC|L L C|CORPORATION|CORP|COMPANY|CO|LTD|LP|LLP|PLLC|PLC|PC|PA)$/, "").trim();
+  return s || "(blank)";
+}
+
+// Reverse lookup: everyone whose employer/occupation matches, grouped by recipient and by donor.
+// Tops up from the FEC first (schedule_a supports contributor_employer/contributor_occupation),
+// probe-gated per query+cycle, so a cold store still answers.
+app.get("/api/donors/byfield", fecLimiter, async (req, res) => {
+  const q = qstr(req.query.q).trim();
+  const field = qstr(req.query.field) === "occupation" ? "occupation" : "employer";
+  const state = qstr(req.query.state).trim();
+  const fresh = qstr(req.query.fresh) === "1";
+  const deep = qstr(req.query.depth) === "6";
+  if (q.length < 3) return res.status(400).json({ error: { message: `Provide at least 3 characters of ${field}.` } });
+
+  const searched = [], skipped = [], errors = [];
+  for (const cycle of donorCycles(deep ? "6" : "2")) {
+    searched.push(String(cycle));
+    const probeKey = `fec:fieldq:${field}:${q.toUpperCase()}:${cycle}`;
+    if (!fresh) {
+      const probe = probeGet(probeKey);
+      if (probe && Date.now() - probe.checkedAt < DONOR_PROBE_FRESH_MS) { skipped.push(String(cycle)); continue; }
+    }
+    try {
+      const params = { two_year_transaction_period: String(cycle), sort: "-contribution_receipt_amount", per_page: "100" };
+      params[field === "occupation" ? "contributor_occupation" : "contributor_employer"] = q;
+      const data = await fecFetch("schedules/schedule_a/", params);
+      ingestScheduleA(data.results);
+      probeSet(probeKey, String(data.pagination?.count ?? 0));
+    } catch (e) { errors.push(`${cycle}: ${e.message}`); }
+  }
+
+  const agg = contribFieldAgg({ q, field, state });
+  // merge raw variants under their canonical form so "FEDEX CORP" + "FEDEX CORPORATION" roll up
+  const merged = new Map();
+  for (const v of agg.variants) {
+    const k = field === "employer" ? normalizeEmployerName(v.value) : (String(v.value || "").toUpperCase().trim() || "(blank)");
+    const g = merged.get(k) || { value: k, total: 0, count: 0, raw: [] };
+    g.total += Number(v.total) || 0; g.count += Number(v.count) || 0;
+    if (v.value && g.raw.length < 8 && !g.raw.includes(v.value)) g.raw.push(v.value);
+    merged.set(k, g);
+  }
+
+  res.json({
+    field, q, totals: agg.totals,
+    recipients: agg.recipients,
+    donors: agg.donors.map((d) => ({ ...d, watched: watchHas(d.donorKey) })),
+    variants: [...merged.values()].sort((a, b) => b.total - a.total).slice(0, 60),
+    cyclesSearched: searched, skippedCycles: skipped,
+    coverage: "Matches itemized rows in this app's stored ledger plus a top-100-per-cycle FEC pull for this query — not the FEC's complete file.",
+    ...(errors.length ? { note: errors.join("; ") } : {}),
+  });
+});
+
+// ---- money-flow graph ----
+
+// Group edge rows into top-N flows. keyOf(row) → node key; returns [{key, name, meta, total, count}].
+function topFlows(rows, keyOf, nameOf, n, metaOf = null) {
+  const m = new Map();
+  for (const r of rows) {
+    const k = keyOf(r);
+    if (!k) continue;
+    const g = m.get(k) || { key: k, name: nameOf(r) || k, total: 0, count: 0, ...(metaOf ? metaOf(r) : {}) };
+    if ((!g.name || g.name === k) && nameOf(r)) g.name = nameOf(r);
+    if (metaOf) { const meta = metaOf(r); for (const [mk, mv] of Object.entries(meta)) if (g[mk] == null && mv != null) g[mk] = mv; }
+    g.total += Number(r.amount) || 0; g.count++;
+    m.set(k, g);
+  }
+  return [...m.values()].sort((a, b) => b.total - a.total).slice(0, n);
+}
+
+// 2-hop money-flow graph around a committee or a donor, from the stored ledger.
+// Committee center: donors in (col 1) ← center (col 2) → payees out (col 3), plus where the top
+// donors ALSO give (col 0) and who ELSE pays the top payees (col 4). Donor center: committees the
+// donor funds (col 3), committees that PAY the donor/payee (col 1), and top co-donors (col 4).
+// trace=1 (committee only) tops up schedule_a + schedule_b from the FEC first, probe-gated.
+app.get("/api/graph", fecLimiter, async (req, res) => {
+  const committeeId = qstr(req.query.committeeId).trim().toUpperCase();
+  const donorKey = qstr(req.query.donorKey).trim();
+  const name = qstr(req.query.name).trim();
+  const cycle = qstr(req.query.cycle).trim(); // "" = all stored cycles
+  const trace = qstr(req.query.trace) === "1";
+  if (!committeeId && !donorKey) {
+    return res.status(400).json({ error: { message: "Provide committeeId or donorKey." } });
+  }
+
+  const notes = [];
+  const nodes = new Map(); // id -> node
+  const edges = [];
+  const addNode = (id, n) => {
+    const cur = nodes.get(id) || { id };
+    for (const [k, v] of Object.entries(n)) if (v != null && (cur[k] == null || k === "col" || k === "center")) cur[k] = v;
+    nodes.set(id, cur);
+  };
+  const addEdge = (from, to, f, kind) => edges.push({ from, to, total: Math.round(f.total * 100) / 100, count: f.count, kind });
+  const inCycle = (rows) => (cycle ? rows.filter((r) => !r.cycle || String(r.cycle) === cycle) : rows);
+  const conduit = (k) => FLOW_CONDUIT_RE.test(String(k || ""));
+
+  if (committeeId) {
+    if (trace && /^C\d{4,}$/.test(committeeId)) {
+      const errs = await topUpCommittee(committeeId, cycle, { disbursements: true });
+      if (errs.length) notes.push(...errs);
+    }
+    const centerId = `c:${committeeId}`;
+    const inRows = inCycle(contribEdgeRows({ recipientIds: [committeeId], kind: "contribution" }));
+    const outRows = inCycle(contribEdgeRows({ recipientIds: [committeeId], kind: "disbursement" }));
+    const centerName = name || inRows.find((r) => r.recipientName)?.recipientName
+      || outRows.find((r) => r.recipientName)?.recipientName || committeeId;
+    addNode(centerId, { kind: "committee", name: centerName, committeeId, col: 2, center: true });
+
+    const donors = topFlows(inRows, (r) => r.donorKey, (r) => r.donorName, 18,
+      (r) => ({ entityType: r.entityType, employer: r.employer, state: r.state }));
+    for (const d of donors) {
+      addNode(`d:${d.key}`, { kind: conduit(d.key) ? "conduit" : ORG_ENTITY_RE.test(d.entityType || "") ? "org" : "donor",
+        name: d.name, donorKey: d.key, employer: d.employer, state: d.state, col: 1 });
+      addEdge(`d:${d.key}`, centerId, d, "contribution");
+    }
+    const payees = topFlows(outRows, (r) => r.donorKey, (r) => r.donorName, 14, (r) => ({ state: r.state }));
+    for (const p of payees) {
+      addNode(`p:${p.key}`, { kind: conduit(p.key) ? "conduit" : "payee", name: p.name, donorKey: p.key, state: p.state, col: 3 });
+      addEdge(centerId, `p:${p.key}`, p, "disbursement");
+    }
+    // pass-through: same key on both sides of the center (money in AND money out)
+    for (const p of payees) if (donors.some((d) => d.key === p.key)) {
+      addNode(`p:${p.key}`, { passThrough: true });
+      addNode(`d:${p.key}`, { passThrough: true });
+    }
+
+    // hop 2 left: where the top (non-conduit) donors also give
+    const hopDonors = donors.filter((d) => !conduit(d.key)).slice(0, 8).map((d) => d.key);
+    if (hopDonors.length) {
+      const rows2 = inCycle(contribEdgeRows({ donorKeys: hopDonors, kind: "contribution" }))
+        .filter((r) => String(r.recipientId || "").toUpperCase() !== committeeId);
+      const byDonor = new Map();
+      for (const r of rows2) {
+        const list = byDonor.get(r.donorKey) || [];
+        list.push(r); byDonor.set(r.donorKey, list);
+      }
+      for (const [dk, list] of byDonor) {
+        for (const f of topFlows(list, (r) => String(r.recipientId || "").toUpperCase(), (r) => r.recipientName, 4)) {
+          addNode(`c:${f.key}`, { kind: "committee", name: f.name, committeeId: f.key, col: 0 });
+          addEdge(`d:${dk}`, `c:${f.key}`, f, "contribution");
+        }
+      }
+    }
+    // hop 2 right: who else pays the top payees
+    const hopPayees = payees.filter((p) => !conduit(p.key)).slice(0, 6).map((p) => p.key);
+    if (hopPayees.length) {
+      const rows3 = inCycle(contribEdgeRows({ donorKeys: hopPayees, kind: "disbursement" }))
+        .filter((r) => String(r.recipientId || "").toUpperCase() !== committeeId);
+      const byPayee = new Map();
+      for (const r of rows3) {
+        const list = byPayee.get(r.donorKey) || [];
+        list.push(r); byPayee.set(r.donorKey, list);
+      }
+      for (const [pk, list] of byPayee) {
+        for (const f of topFlows(list, (r) => String(r.recipientId || "").toUpperCase(), (r) => r.recipientName, 3)) {
+          addNode(`c2:${f.key}`, { kind: "committee", name: f.name, committeeId: f.key, col: 4 });
+          addEdge(`c2:${f.key}`, `p:${pk}`, f, "disbursement");
+        }
+      }
+    }
+  } else {
+    // donor-centered graph
+    const centerId = `d:${donorKey}`;
+    const gaveRows = inCycle(contribEdgeRows({ donorKeys: [donorKey], kind: "contribution" }));
+    const paidRows = inCycle(contribEdgeRows({ donorKeys: [donorKey], kind: "disbursement" })); // committees that PAID this entity
+    const centerName = name || gaveRows.find((r) => r.donorName)?.donorName
+      || paidRows.find((r) => r.donorName)?.donorName || donorKey.split("|")[0];
+    addNode(centerId, { kind: "donor", name: centerName, donorKey, col: 2, center: true });
+
+    const recips = topFlows(gaveRows, (r) => String(r.recipientId || "").toUpperCase(), (r) => r.recipientName, 14, (r) => ({ source: r.source }));
+    for (const f of recips) {
+      addNode(`c:${f.key}`, { kind: "committee", name: f.name, committeeId: f.key, source: f.source, col: 3 });
+      addEdge(centerId, `c:${f.key}`, f, "contribution");
+    }
+    const payers = topFlows(paidRows, (r) => String(r.recipientId || "").toUpperCase(), (r) => r.recipientName, 8);
+    for (const f of payers) {
+      addNode(`cp:${f.key}`, { kind: "committee", name: f.name, committeeId: f.key, col: 1 });
+      addEdge(`cp:${f.key}`, centerId, f, "disbursement");
+    }
+    // hop 2: top co-donors of the committees this donor funds
+    const hopRecips = recips.slice(0, 6).map((f) => f.key).filter(Boolean);
+    if (hopRecips.length) {
+      const rows2 = inCycle(contribEdgeRows({ recipientIds: hopRecips, kind: "contribution" }))
+        .filter((r) => r.donorKey !== donorKey && !conduit(r.donorKey));
+      const byRecip = new Map();
+      for (const r of rows2) {
+        const rid = String(r.recipientId || "").toUpperCase();
+        const list = byRecip.get(rid) || [];
+        list.push(r); byRecip.set(rid, list);
+      }
+      for (const [rid, list] of byRecip) {
+        for (const f of topFlows(list, (r) => r.donorKey, (r) => r.donorName, 4, (r) => ({ entityType: r.entityType }))) {
+          addNode(`d2:${f.key}`, { kind: ORG_ENTITY_RE.test(f.entityType || "") ? "org" : "donor", name: f.name, donorKey: f.key, col: 4 });
+          addEdge(`d2:${f.key}`, `c:${rid}`, f, "contribution");
+        }
+      }
+    }
+    if (paidRows.length) notes.push("Left column = committees whose disbursements name this entity as payee (vendor/recipient), from stored Schedule B rows.");
+  }
+
+  const nodeList = [...nodes.values()].slice(0, 80);
+  const keep = new Set(nodeList.map((n) => n.id));
+  res.json({
+    center: committeeId ? { committeeId, name } : { donorKey, name },
+    cycle: cycle || "all",
+    nodes: nodeList,
+    edges: edges.filter((e) => keep.has(e.from) && keep.has(e.to)).slice(0, 160),
+    coverage: "Flows are drawn from this app's stored ledger (what's been pulled so far), not the FEC's complete file. Trace FEC tops up the center committee's top-100 receipts and disbursements.",
+    ...(notes.length ? { note: notes.join(" ") } : {}),
+  });
+});
+
+// Itemized rows behind a graph node or edge — the drill-down table under the flow graph.
+// donorKey alone = everything that key gave (contribution) or was paid (disbursement);
+// committeeId alone = everything touching that committee; both = that exact edge.
+// Local-only (reads the stored ledger), so no FEC limiter needed. Memo rows are excluded
+// at the accessor (they never count toward totals).
+app.get("/api/flows/rows", (req, res) => {
+  const committeeId = qstr(req.query.committeeId).trim().toUpperCase();
+  const donorKey = qstr(req.query.donorKey).trim();
+  const kind = ["contribution", "disbursement"].includes(qstr(req.query.kind)) ? qstr(req.query.kind) : null;
+  const cycle = qstr(req.query.cycle).trim();
+  const date = qstr(req.query.date).trim(); // YYYY-MM-DD — timing-cluster drill-down
+  if (!committeeId && !donorKey) {
+    return res.status(400).json({ error: { message: "Provide committeeId and/or donorKey." } });
+  }
+  let rows = contribEdgeRows({
+    recipientIds: committeeId ? [committeeId] : null,
+    donorKeys: donorKey ? [donorKey] : null,
+    kind,
+    limit: 5000,
+  });
+  if (cycle) rows = rows.filter((r) => !r.cycle || String(r.cycle) === cycle);
+  if (date) rows = rows.filter((r) => r.date === date);
+  rows.sort((a, b) => String(b.date || "").localeCompare(String(a.date || "")) || ((b.amount || 0) - (a.amount || 0)));
+  const total = rows.reduce((a, r) => a + (Number(r.amount) || 0), 0);
+  res.json({
+    rows: rows.slice(0, 500).map((r) => ({
+      source: r.source, kind: r.kind, date: r.date || "",
+      donorName: r.donorName, donorKey: r.donorKey, employer: r.employer, occupation: r.occupation,
+      city: r.city, state: r.state, recipientId: r.recipientId, recipientName: r.recipientName,
+      cycle: r.cycle != null ? String(r.cycle) : "", amount: r.amount, report: r.report ?? null,
+    })),
+    count: rows.length,
+    total: Math.round(total * 100) / 100,
+    truncated: rows.length > 500,
+    cycle: cycle || "all",
+  });
+});
+
+// ---- pattern detection ----
+
+// Individual per-election limit was $3,300 (2023-24) and $3,500 (2025-26); doubled = primary+general
+// on one check. Amount at/above the low bound is treated as a max-out signal.
+const MAXOUT_MIN = 3300;
+
+// Same-day donor clusters for one committee — fundraiser events, workplace bundling, and
+// coordinated max-out days. Reads the stored ledger (memo excluded, conduits excluded);
+// tops up the committee's top-100 receipts first (probe-gated, same as overlap).
+app.get("/api/patterns/timing", fecLimiter, async (req, res) => {
+  const committeeId = qstr(req.query.committeeId).trim().toUpperCase();
+  const cycle = qstr(req.query.cycle).trim(); // "" = all stored cycles
+  const minDonors = Math.max(2, Number(qstr(req.query.minDonors, "3")) || 3);
+  if (!committeeId) return res.status(400).json({ error: { message: "Provide committeeId." } });
+
+  const errors = /^C\d{4,}$/.test(committeeId) ? await topUpCommittee(committeeId, cycle) : [];
+  let rows = contribEdgeRows({ recipientIds: [committeeId], kind: "contribution" })
+    .filter((r) => !FLOW_CONDUIT_RE.test(String(r.donorKey || "")) && r.date);
+  if (cycle) rows = rows.filter((r) => !r.cycle || String(r.cycle) === cycle);
+
+  const byDate = new Map();
+  for (const r of rows) {
+    const g = byDate.get(r.date) || { date: r.date, total: 0, gifts: 0, _donors: new Set(), maxOuts: 0, _emp: new Map() };
+    const amt = Number(r.amount) || 0;
+    g.total += amt; g.gifts++;
+    g._donors.add(r.donorKey);
+    if (amt >= MAXOUT_MIN) g.maxOuts++;
+    const emp = normalizeEmployerName(r.employer || "");
+    // employer bundling only means something for real employers — skip the catch-all buckets
+    if (emp && !/^(\(blank\)|SELF-EMPLOYED|NOT EMPLOYED|RETIRED|HOMEMAKER|STUDENT)$/.test(emp)) {
+      const e = g._emp.get(emp) || { employer: emp, donors: new Set(), total: 0 };
+      e.donors.add(r.donorKey); e.total += amt;
+      g._emp.set(emp, e);
+    }
+    byDate.set(r.date, g);
+  }
+
+  const clusters = [...byDate.values()]
+    .map((g) => ({
+      date: g.date, total: Math.round(g.total * 100) / 100, gifts: g.gifts,
+      donors: g._donors.size, maxOuts: g.maxOuts,
+      // employers with 2+ distinct donors on the same day = likely workplace bundling
+      employers: [...g._emp.values()].filter((e) => e.donors.size >= 2)
+        .map((e) => ({ employer: e.employer, donors: e.donors.size, total: Math.round(e.total * 100) / 100 }))
+        .sort((a, b) => b.total - a.total).slice(0, 4),
+    }))
+    .filter((g) => g.donors >= minDonors)
+    .sort((a, b) => b.total - a.total)
+    .slice(0, 40);
+
+  res.json({
+    committeeId, cycle: cycle || "all", minDonors, clusters,
+    daysScanned: byDate.size, rowsScanned: rows.length,
+    coverage: "Clusters are computed over this app's stored ledger (top-100 per top-up pull), not the FEC's complete file — open the Donors ledger and page deeper to widen coverage.",
+    ...(errors.length ? { note: errors.join("; ") } : {}),
+  });
+});
+
+// "Donors most like this one" — recipient-slate overlap (Jaccard). For a PAC this exposes
+// aligned giving networks; works for individuals too (org donors are tagged so the UI can filter).
+app.get("/api/patterns/similar", (req, res) => {
+  const donorKey = qstr(req.query.donorKey).trim();
+  if (!donorKey) return res.status(400).json({ error: { message: "Provide donorKey." } });
+
+  const mineRows = contribEdgeRows({ donorKeys: [donorKey], kind: "contribution" });
+  const mine = new Set(mineRows.map((r) => String(r.recipientId || "").toUpperCase()).filter(Boolean));
+  if (!mine.size) return res.json({ donorKey, recipients: 0, similar: [], coverage: "No stored contributions for this donor yet." });
+
+  // candidate pool: every donor who shares at least one recipient (grouped in JS from one pull)
+  const poolRows = contribEdgeRows({ recipientIds: [...mine], kind: "contribution", limit: 40000 });
+  const shared = new Map(); // donorKey -> { key, name, entityType, state, _recips:Set, sharedTotal }
+  for (const r of poolRows) {
+    if (r.donorKey === donorKey || FLOW_CONDUIT_RE.test(String(r.donorKey || ""))) continue;
+    const g = shared.get(r.donorKey) || { key: r.donorKey, name: r.donorName, entityType: r.entityType, state: r.state, _recips: new Map(), sharedTotal: 0 };
+    if (!g.name && r.donorName) g.name = r.donorName;
+    if (!g.entityType && r.entityType) g.entityType = r.entityType;
+    const rid = String(r.recipientId || "").toUpperCase();
+    if (!g._recips.has(rid)) g._recips.set(rid, r.recipientName || rid);
+    g.sharedTotal += Number(r.amount) || 0;
+    shared.set(r.donorKey, g);
+  }
+
+  // full slate size |B| for the top candidates only (one bounded pull, counted in JS)
+  const top = [...shared.values()].sort((a, b) => b._recips.size - a._recips.size || b.sharedTotal - a.sharedTotal).slice(0, 80);
+  const slateRows = contribEdgeRows({ donorKeys: top.map((t) => t.key), kind: "contribution", limit: 40000 });
+  const slateSize = new Map();
+  for (const r of slateRows) {
+    const rid = String(r.recipientId || "").toUpperCase();
+    if (!rid) continue;
+    const s = slateSize.get(r.donorKey) || new Set();
+    s.add(rid); slateSize.set(r.donorKey, s);
+  }
+
+  const similar = top.map((t) => {
+    const sharedN = t._recips.size;
+    const bN = slateSize.get(t.key)?.size || sharedN;
+    const jaccard = sharedN / (mine.size + bN - sharedN);
+    return {
+      donorKey: t.key, name: t.name || t.key.split("|")[0], state: t.state,
+      org: ORG_ENTITY_RE.test(t.entityType || ""), entityType: t.entityType,
+      shared: sharedN, theirRecipients: bN, jaccard: Math.round(jaccard * 1000) / 1000,
+      sharedTotal: Math.round(t.sharedTotal * 100) / 100,
+      sharedNames: [...t._recips.values()].slice(0, 3),
+      watched: watchHas(t.key),
+    };
+  })
+    .filter((s) => s.shared >= 2)
+    .sort((a, b) => b.jaccard - a.jaccard || b.sharedTotal - a.sharedTotal)
+    .slice(0, 30);
+
+  res.json({
+    donorKey, recipients: mine.size, similar,
+    coverage: "Similarity compares recipient slates within this app's stored ledger — donors and gifts not yet pulled aren't counted.",
+  });
+});
+
+// Employer/occupation → industry sector. Mirror of the client's SECTOR_RULES so server
+// aggregates and UI language stay consistent.
+const SECTOR_RULES_SRV = [
+  ["Pharma & Healthcare", /pharm|health|medical|hospital|clinic|biotech|drug store|compounding|nurs|physician|doctor|dental|chiro|optom|rehab|therapy|wellness|emed|oncol/i],
+  ["Finance & Banking", /\bbank\b|capital|financ|invest|\bfund\b|asset|wealth|insur|mortgage|credit union|loan|brokerage|securit|hedge|private equity|\bpe\b/i],
+  ["Real Estate & Construction", /real estate|realt|propert|develop|construct|homebuil|housing|residential|commercial|contractor|builder/i],
+  ["Defense & Aerospace", /defense|aerospace|military|weapon|lockheed|raytheon|boeing|northrop|general dynamic|l3|bae system/i],
+  ["Energy & Utilities", /energy|oil\b|gas\b|\bpetrol|coal|utility|electric|power\b|nuclear|pipeline|refin|solar|wind\b|exxon|chevron|shell/i],
+  ["Tech & Telecom", /tech|software|internet|digital|cyber|data center|compute|telecom|broadcast|cable|wireless|network|semicon/i],
+  ["Legal & Lobbying", /attorney|lawyer|legal|law firm|\blaw\b|counsel|litigat|lobby|government relation|public affair/i],
+  ["Retail & Hospitality", /retail|restaurant|food\b|beverage|grocery|hotel|hospitality|travel|tourism|entertainment|gaming|casino|wholesale/i],
+  ["Automotive & Manufacturing", /manufactur|automotive|\bauto\b|vehicle|truck|industri|production|factory|steel|aluminum|chemical/i],
+  ["Agriculture", /farm|agricult|livestock|crop|dairy|poultry|ranc|timber|forestry/i],
+  ["Education & Research", /school|universit|college|educat|academic|research institute/i],
+  ["Consulting & PR", /consult|strateg|advisory|public relations|marketing|advertis|communications/i],
+  ["Retired / Individual", /retired|homemaker|self[- ]employed|student|housewife|independent/i],
+];
+function classifySectorSrv(employer = "", occupation = "") {
+  const txt = `${employer || ""} ${occupation || ""}`;
+  for (const [sector, re] of SECTOR_RULES_SRV) if (re.test(txt)) return sector;
+  return "Other";
+}
+
+const rnd2 = (v) => Math.round(v * 100) / 100;
+
+// Donor movement between cycles — who's new, who's loyal, who left (and where their money
+// went this cycle). Requires a specific cycle; prior = cycle − 2. Top-ups are probe-gated.
+app.get("/api/patterns/migration", fecLimiter, async (req, res) => {
+  const committeeId = qstr(req.query.committeeId).trim().toUpperCase();
+  const cycle = Number(qstr(req.query.cycle)) || 0;
+  if (!committeeId || !cycle) return res.status(400).json({ error: { message: "Provide committeeId and cycle." } });
+  const prior = cycle - 2;
+
+  const errors = [];
+  if (/^C\d{4,}$/.test(committeeId)) {
+    errors.push(...await topUpCommittee(committeeId, String(cycle)));
+    errors.push(...await topUpCommittee(committeeId, String(prior)));
+  }
+
+  const rows = contribEdgeRows({ recipientIds: [committeeId], kind: "contribution" })
+    .filter((r) => !FLOW_CONDUIT_RE.test(String(r.donorKey || "")));
+  const agg = (cy) => {
+    const m = new Map();
+    for (const r of rows) {
+      if (String(r.cycle) !== String(cy)) continue;
+      const g = m.get(r.donorKey) || { donorKey: r.donorKey, name: r.donorName, employer: r.employer,
+        state: r.state, org: ORG_ENTITY_RE.test(r.entityType || ""), total: 0, count: 0 };
+      if (!g.name && r.donorName) g.name = r.donorName;
+      g.total += Number(r.amount) || 0; g.count++;
+      m.set(r.donorKey, g);
+    }
+    return m;
+  };
+  const cur = agg(cycle), prev = agg(prior);
+
+  const fresh = [...cur.values()].filter((d) => !prev.has(d.donorKey));
+  const loyal = [...cur.values()].filter((d) => prev.has(d.donorKey));
+  const lost = [...prev.values()].filter((d) => !cur.has(d.donorKey));
+  const sum = (list) => rnd2(list.reduce((a, d) => a + d.total, 0));
+
+  // where the lost donors' money went THIS cycle (their top other recipients)
+  const lostTop = lost.sort((a, b) => b.total - a.total).slice(0, 40);
+  const wentRows = lostTop.length
+    ? contribEdgeRows({ donorKeys: lostTop.map((d) => d.donorKey), kind: "contribution" })
+      .filter((r) => String(r.cycle) === String(cycle) && String(r.recipientId || "").toUpperCase() !== committeeId)
+    : [];
+  const wentBy = new Map();
+  for (const r of wentRows) {
+    const m = wentBy.get(r.donorKey) || new Map();
+    const rid = String(r.recipientId || "").toUpperCase();
+    const g = m.get(rid) || { recipientId: rid, name: r.recipientName || rid, total: 0 };
+    g.total += Number(r.amount) || 0;
+    m.set(rid, g); wentBy.set(r.donorKey, m);
+  }
+
+  res.json({
+    committeeId, cycle: String(cycle), prior: String(prior),
+    summary: {
+      new: { donors: fresh.length, total: sum(fresh) },
+      loyal: { donors: loyal.length, total: sum(loyal) },
+      lost: { donors: lost.length, total: sum(lost) },
+      priorDonors: prev.size,
+      retentionPct: prev.size ? Math.round((loyal.length / prev.size) * 100) : null,
+    },
+    topNew: fresh.sort((a, b) => b.total - a.total).slice(0, 15).map((d) => ({ ...d, total: rnd2(d.total) })),
+    topLost: lostTop.slice(0, 15).map((d) => ({
+      ...d, total: rnd2(d.total),
+      wentTo: [...(wentBy.get(d.donorKey)?.values() || [])].sort((a, b) => b.total - a.total).slice(0, 3)
+        .map((w) => ({ ...w, total: rnd2(w.total) })),
+    })),
+    coverage: `Movement compares cycles ${prior} and ${cycle} within this app's stored ledger (top-100 per top-up pull) — a donor 'lost' here may simply not be pulled yet. "Went to" only shows if their ${cycle} gifts are stored.`,
+    ...(errors.length ? { note: errors.join("; ") } : {}),
+  });
+});
+
+// Donor-base composition for one committee: geography (in-state vs out), industry sectors,
+// and household clusters (same surname + city — how over-limit money legally spreads across
+// families). One row pull, three aggregations.
+app.get("/api/patterns/composition", fecLimiter, async (req, res) => {
+  const committeeId = qstr(req.query.committeeId).trim().toUpperCase();
+  const cycle = qstr(req.query.cycle).trim();
+  const homeState = qstr(req.query.homeState).trim().toUpperCase();
+  if (!committeeId) return res.status(400).json({ error: { message: "Provide committeeId." } });
+
+  const errors = /^C\d{4,}$/.test(committeeId) ? await topUpCommittee(committeeId, cycle) : [];
+  let rows = contribEdgeRows({ recipientIds: [committeeId], kind: "contribution" })
+    .filter((r) => !FLOW_CONDUIT_RE.test(String(r.donorKey || "")));
+  if (cycle) rows = rows.filter((r) => !r.cycle || String(r.cycle) === cycle);
+
+  // ---- geography ----
+  const stateM = new Map(), cityM = new Map();
+  let inTotal = 0, outTotal = 0, inDonors = new Set(), outDonors = new Set(), unknownTotal = 0;
+  for (const r of rows) {
+    const st = String(r.state || "").toUpperCase();
+    const amt = Number(r.amount) || 0;
+    if (!st) { unknownTotal += amt; continue; }
+    const sg = stateM.get(st) || { state: st, total: 0, donors: new Set() };
+    sg.total += amt; sg.donors.add(r.donorKey); stateM.set(st, sg);
+    if (r.city) {
+      const ck = `${String(r.city).toUpperCase().trim()}, ${st}`;
+      const cg = cityM.get(ck) || { city: ck, total: 0, donors: new Set() };
+      cg.total += amt; cg.donors.add(r.donorKey); cityM.set(ck, cg);
+    }
+    if (homeState && st === homeState) { inTotal += amt; inDonors.add(r.donorKey); }
+    else if (homeState) { outTotal += amt; outDonors.add(r.donorKey); }
+  }
+  const topGeo = (m) => [...m.values()].sort((a, b) => b.total - a.total).slice(0, 12)
+    .map((g) => ({ ...g, total: rnd2(g.total), donors: g.donors.size }));
+
+  // ---- sectors ----
+  const secM = new Map();
+  for (const r of rows) {
+    const sector = classifySectorSrv(r.employer, r.occupation);
+    const g = secM.get(sector) || { sector, total: 0, gifts: 0, donors: new Set(), emp: new Map() };
+    const amt = Number(r.amount) || 0;
+    g.total += amt; g.gifts++; g.donors.add(r.donorKey);
+    const emp = normalizeEmployerName(r.employer || "");
+    if (emp && emp !== "(blank)") g.emp.set(emp, (g.emp.get(emp) || 0) + amt);
+    secM.set(sector, g);
+  }
+  const grand = rows.reduce((a, r) => a + (Number(r.amount) || 0), 0);
+  const sectors = [...secM.values()].sort((a, b) => b.total - a.total).map((g) => ({
+    sector: g.sector, total: rnd2(g.total), gifts: g.gifts, donors: g.donors.size,
+    pct: grand ? Math.round((g.total / grand) * 1000) / 10 : 0,
+    topEmployers: [...g.emp.entries()].sort((a, b) => b[1] - a[1]).slice(0, 3)
+      .map(([employer, total]) => ({ employer, total: rnd2(total) })),
+  }));
+
+  // ---- households (individuals only: same surname + same city) ----
+  const surnameOf = (nm) => {
+    const s = String(nm || "").toUpperCase().trim();
+    if (!s) return "";
+    if (s.includes(",")) return s.split(",")[0].trim();
+    const toks = s.split(/\s+/);
+    return toks.length > 1 ? toks[toks.length - 1] : s;
+  };
+  const hhM = new Map();
+  for (const r of rows) {
+    if (ORG_ENTITY_RE.test(r.entityType || "")) continue;
+    const surname = surnameOf(r.donorName);
+    const place = String(r.city || r.state || "").toUpperCase().trim();
+    if (!surname || !place || surname.length < 3) continue;
+    const k = `${surname}|${place}`;
+    const g = hhM.get(k) || { surname, place, members: new Map(), total: 0, dates: new Map() };
+    const amt = Number(r.amount) || 0;
+    g.total += amt;
+    const m = g.members.get(r.donorKey) || { name: r.donorName, total: 0, count: 0 };
+    m.total += amt; m.count++;
+    g.members.set(r.donorKey, m);
+    if (r.date) {
+      const dset = g.dates.get(r.date) || new Set();
+      dset.add(r.donorKey); g.dates.set(r.date, dset);
+    }
+    hhM.set(k, g);
+  }
+  const households = [...hhM.values()].filter((g) => g.members.size >= 2)
+    .map((g) => ({
+      surname: g.surname, place: g.place, total: rnd2(g.total), members: g.members.size,
+      // days when 2+ members of the household gave together — the coordinated-giving tell
+      sameDayEvents: [...g.dates.values()].filter((s) => s.size >= 2).length,
+      names: [...g.members.values()].sort((a, b) => b.total - a.total)
+        .map((m) => ({ name: m.name, total: rnd2(m.total), count: m.count })),
+    }))
+    .sort((a, b) => (b.sameDayEvents - a.sameDayEvents) || (b.total - a.total))
+    .slice(0, 20);
+
+  res.json({
+    committeeId, cycle: cycle || "all", homeState: homeState || null,
+    rowsScanned: rows.length, grandTotal: rnd2(grand),
+    geo: {
+      ...(homeState ? {
+        inState: { total: rnd2(inTotal), donors: inDonors.size },
+        outState: { total: rnd2(outTotal), donors: outDonors.size },
+        inStatePct: (inTotal + outTotal) ? Math.round((inTotal / (inTotal + outTotal)) * 1000) / 10 : null,
+      } : {}),
+      unknownTotal: rnd2(unknownTotal),
+      byState: topGeo(stateM), byCity: topGeo(cityM),
+    },
+    sectors, households,
+    coverage: "Composition reads this app's stored ledger (top-100 per top-up pull), not the FEC's complete file — shares describe the stored itemized rows, and small-dollar unitemized money is never included.",
+    ...(errors.length ? { note: errors.join("; ") } : {}),
+  });
+});
+
+// Outside money (Schedule E) with funder chains: who spends independently FOR/AGAINST this
+// candidate, and who funds those spenders. FOR and AGAINST are never summed (FEC invariant).
+app.get("/api/patterns/outside", fecLimiter, async (req, res) => {
+  const candidateId = qstr(req.query.candidateId).trim().toUpperCase();
+  const cycle = qstr(req.query.cycle).trim();
+  if (!candidateId || !cycle) return res.status(400).json({ error: { message: "Provide candidateId and cycle." } });
+
+  let results = null, cycleUsed = cycle;
+  const notes = [];
+  try {
+    let d = await fecFetch("schedules/schedule_e/", {
+      candidate_id: candidateId, two_year_transaction_period: cycle,
+      sort: "-expenditure_amount", per_page: "100",
+    });
+    if (!d.results?.length) { // same fallback the outside-money panel uses
+      const prev = String(Number(cycle) - 2);
+      d = await fecFetch("schedules/schedule_e/", {
+        candidate_id: candidateId, two_year_transaction_period: prev,
+        sort: "-expenditure_amount", per_page: "100",
+      });
+      if (d.results?.length) cycleUsed = prev;
+    }
+    results = d.results || [];
+  } catch (e) {
+    return res.status(502).json({ error: { message: `Schedule E unavailable: ${e.message}` } });
+  }
+
+  const m = new Map();
+  let totalSupport = 0, totalOppose = 0;
+  for (const r of results) {
+    const amt = Number(r.expenditure_amount) || 0;
+    const cid = String(r.committee_id || "").toUpperCase();
+    const k = cid || (r.committee_name || r.payee_name || "?");
+    const g = m.get(k) || { committeeId: cid || null, name: r.committee_name || r.payee_name || "?", support: 0, oppose: 0 };
+    if ((r.support_oppose_indicator || "") === "S") { g.support += amt; totalSupport += amt; }
+    else { g.oppose += amt; totalOppose += amt; }
+    m.set(k, g);
+  }
+  const spenders = [...m.values()]
+    .sort((a, b) => Math.max(b.support, b.oppose) - Math.max(a.support, a.oppose))
+    .slice(0, 8);
+
+  // funder chains: top-up + read each big spender's own donors from the stored ledger
+  for (const s of spenders.slice(0, 5)) {
+    if (!s.committeeId || !/^C\d{4,}$/.test(s.committeeId)) continue;
+    const errs = await topUpCommittee(s.committeeId, cycleUsed);
+    if (errs.length) notes.push(...errs);
+    const dRows = contribEdgeRows({ recipientIds: [s.committeeId], kind: "contribution" })
+      .filter((r) => !r.cycle || String(r.cycle) === cycleUsed);
+    const dm = new Map();
+    for (const r of dRows) {
+      const g = dm.get(r.donorKey) || { donorKey: r.donorKey, name: r.donorName || r.donorKey.split("|")[0],
+        org: ORG_ENTITY_RE.test(r.entityType || ""), conduit: FLOW_CONDUIT_RE.test(String(r.donorKey || "")), total: 0 };
+      g.total += Number(r.amount) || 0;
+      dm.set(r.donorKey, g);
+    }
+    s.funders = [...dm.values()].filter((d) => !d.conduit).sort((a, b) => b.total - a.total).slice(0, 8)
+      .map((d) => ({ ...d, total: rnd2(d.total) }));
+  }
+
+  res.json({
+    candidateId, cycleUsed,
+    onFile: results.length,
+    totalSupport: rnd2(totalSupport), totalOppose: rnd2(totalOppose),
+    spenders: spenders.map((s) => ({ ...s, support: rnd2(s.support), oppose: rnd2(s.oppose) })),
+    coverage: "Spending is the FEC's top-100 Schedule E rows for this candidate; each spender's funders come from this app's stored ledger after a top-100 receipts top-up — super PAC donor lists run long, so treat these as the biggest visible funders, not all of them. FOR and AGAINST money are reported separately and must never be summed.",
+    ...(notes.length ? { note: notes.join("; ") } : {}),
+  });
+});
+
 // Stored FEC rows for a committee — the offline/rate-limited fallback for the donor table.
 // MUST be registered BEFORE app.get("/api/fec/*") below or the wildcard swallows it and answers
 // "Endpoint not allowed: stored" (same class of bug as the districts/competitive-vs-:fips fix).
@@ -1142,7 +1909,12 @@ app.get("/api/tn/candidates", async (req, res) => {
     variantsTried: variants, broadened,
     ...(noteParts.length ? { note: noteParts.join(" ") } : {}),
   };
-  cacheSet(ck, out, TTL.tn);
+  // Zero-result candidate/PAC searches get a SHORT TTL, not the full-day TTL used for populated
+  // results. A genuine "no such entity" answer is cheap to re-check, but a transient TREF session
+  // hiccup or an entity that just filed (e.g. a new gubernatorial candidacy) would otherwise get
+  // stuck showing "no results" for up to a day once cached — same negative-cache pattern already
+  // used for report-list bounces (TN_BOUNCE_TTL_MS).
+  cacheSet(ck, out, out.count === 0 ? TN_BOUNCE_TTL_MS : TTL.tn);
   tnSearchSave({ id: ck, name, office, year, type, count: out.count, lastRefresh: Date.now() });
   res.json(out);
 });
@@ -1205,6 +1977,26 @@ app.get("/api/tn/money", async (req, res) => {
   res.json(out);
 });
 
+// TREF's cesearch (contributor-name index) is a SEPARATE, live-only index from the one this app
+// builds by parsing entities' actual filed reports (tnLedgerData) — the two can disagree, and
+// cesearch is the one known to lag/miss records (see tnLedgerData's header comment). So when a
+// live cesearch donor lookup comes up empty, fall back to this app's own stored ledger (already
+// populated by viewing any entity's Money Flows/dossier) before reporting "no contributions found".
+// Returns a result shaped like normalizeMoney()'s output (headers/rows/totalAmount/count) so the
+// client's existing donor-lookup renderer needs no changes, or null if the store has nothing either.
+function tnStoredDonorFallback(name) {
+  const groups = contribDonorGroups({ q: name });
+  if (!groups.length) return null;
+  // TN-sourced rows only — this endpoint is specifically the TN registry lookup, so a federal
+  // (FEC) gift the same donor made shouldn't be blended in and misread as a TN state record.
+  const rows = groups.flatMap((g) => contribDonorRows(g.donorKey)).filter((r) => !r.memo && r.source === "tn");
+  if (!rows.length) return null;
+  const headers = ["Type", "Amount", "Date", "Report Name", "Recipient Name", "Contributor Name"];
+  const outRows = rows.map((r) => [r.entityType || "", `$${(Number(r.amount) || 0).toFixed(2)}`, r.date || "", r.report || "", r.recipientName || "", r.donorName || name]);
+  const totalAmount = rows.reduce((a, r) => a + (Number(r.amount) || 0), 0);
+  return { headers, rows: outRows, count: outRows.length, totalAmount, stored: true };
+}
+
 // ---- TN donor reverse lookup: where did this contributor give? ----
 app.get("/api/tn/donor", async (req, res) => {
   const name = qstr(req.query.name), electionYear = qstr(req.query.electionYear), reportYear = qstr(req.query.reportYear);
@@ -1243,7 +2035,17 @@ app.get("/api/tn/donor", async (req, res) => {
         cyclesSearched: TREND_CYCLES.map((c) => c.label),
         ...(errors.length ? { note: `Some cycles failed: ${errors.join("; ")}` } : {}),
       };
-      cacheSet(ck, out, TTL.tn);
+      // TREF's own contributor-name search index can lag behind (or simply miss) gifts this app
+      // has already parsed out of the entity's actual filed reports — fall back to that stored
+      // ledger rather than reporting a dead end when it has data cesearch doesn't.
+      if (out.count === 0) {
+        const stored = tnStoredDonorFallback(name);
+        if (stored) {
+          Object.assign(out, stored);
+          out.note = `TREF's live contributor search found nothing for "${name}" (its own name index can lag behind filed reports), but ${stored.count} gift${stored.count === 1 ? "" : "s"} totaling $${Math.round(stored.totalAmount).toLocaleString()} were found in this app's own itemized ledger (parsed from actual filed reports — see the Donors tab for full cross-referenced history).`;
+        }
+      }
+      cacheSet(ck, out, out.count === 0 ? TN_BOUNCE_TTL_MS : TTL.tn);
       return res.json(out);
     }
     if (!/^\d{1,4}$/.test(electionYear) || !/^(19|20)\d{2}$/.test(reportYear)) {
@@ -1254,7 +2056,14 @@ app.get("/api/tn/donor", async (req, res) => {
       500
     );
     const out = { source: "tn-tref", name, electionYear, reportYear, ...result };
-    cacheSet(ck, out, TTL.tn);
+    if (out.count === 0) {
+      const stored = tnStoredDonorFallback(name);
+      if (stored) {
+        Object.assign(out, stored);
+        out.note = `TREF's live contributor search found nothing for "${name}" in this specific year (its own name index can lag behind filed reports), but ${stored.count} gift${stored.count === 1 ? "" : "s"} totaling $${Math.round(stored.totalAmount).toLocaleString()} across all years were found in this app's own itemized ledger — see the Donors tab for full cross-referenced history.`;
+      }
+    }
+    cacheSet(ck, out, out.count === 0 ? TN_BOUNCE_TTL_MS : TTL.tn);
     res.json(out);
   } catch (e) {
     res.status(502).json({ error: { message: `TN donor lookup failed: ${e.message}` } });
@@ -1446,18 +2255,16 @@ app.get("/api/tn/activity", async (req, res) => {
 // reports (report_full itemized schedules), aggregated across reports. This is the reliable money-
 // flows source — TREF's name-based C&E search misses much PAC activity, but the reports have the
 // itemized Contributor/Vendor tables directly. Cached; details are shared with the activity scan. ----
-app.get("/api/tn/ledger", async (req, res) => {
-  const { id = "", owner = "" } = req.query;
-  if (!id || !/^\d{1,12}$/.test(String(id))) {
-    return res.status(400).json({ error: { message: "A numeric TN entity id is required for the report ledger." } });
-  }
-  const forceRefresh = req.query._refresh === "1";
+// Shared by the /api/tn/ledger route AND the TN dossier (which needs the same itemized money-flows
+// data) — factored out so both reuse the same cache entry / donor-ledger ingestion instead of the
+// dossier triggering a second, redundant TREF scrape.
+async function tnLedgerData(id, owner = "", forceRefresh = false) {
   const ck = `tn:ledger:v4:${id}`;
   if (!forceRefresh) {
     const hit = cacheGetWithAge(ck);
-    if (hit) return res.json({ ...hit.value, cachedAt: hit.createdAt });
+    if (hit) return { ...hit.value, cachedAt: hit.createdAt };
   }
-  try {
+  {
     const list = await cachedListReports(id, owner, forceRefresh);
     // Collapse amended/duplicate filings so a period isn't double-counted (see latestFilingVersions).
     const reports = latestFilingVersions(list.rows || []);
@@ -1519,9 +2326,8 @@ app.get("/api/tn/ledger", async (req, res) => {
     // a bounced list or an aborted fetch run means this aggregate is unreliable — serve it but
     // don't cache it, so correct data isn't blocked for the full TTL
     if (!list.note && !aborted) cacheSet(ck, out, TTL.tn);
-    res.json(out);
     // Feed the permanent donor ledger — only from a healthy read (a TREF bounce or aborted run
-    // must not purge real rows or store a partial picture). setImmediate = after the response.
+    // must not purge real rows or store a partial picture). setImmediate = after the caller returns.
     if (!aborted && !list.note) {
       // Superseded originals: reportIds in the full list that the amended-filing collapse dropped.
       const keptIds = new Set(withRid.map((x) => String(x.reportId)));
@@ -1537,10 +2343,55 @@ app.get("/api/tn/ledger", async (req, res) => {
         } catch (e) { console.warn("[tn ledger ingest]", e.message); }
       });
     }
+    return out;
+  }
+}
+
+app.get("/api/tn/ledger", async (req, res) => {
+  const { id = "", owner = "" } = req.query;
+  if (!id || !/^\d{1,12}$/.test(String(id))) {
+    return res.status(400).json({ error: { message: "A numeric TN entity id is required for the report ledger." } });
+  }
+  const forceRefresh = req.query._refresh === "1";
+  try {
+    const out = await tnLedgerData(id, owner, forceRefresh);
+    res.json(out);
   } catch (e) {
     res.status(502).json({ error: { message: `TN report ledger failed: ${e.message}` } });
   }
 });
+
+// Server-side mirror of the client's groupLedger() — group itemized TN ledger rows ({name, amount})
+// by name, sum, and dedupe conduit pass-throughs (WinRed/ActBlue/Democracy Engine/Anedot), which
+// aggregate OTHER people's earmarked money and must be reported separately, not counted as real donors.
+const TN_CONDUIT_RE = /^(WINRED|ACTBLUE|WINRED TECHNICAL|DEMOCRACY ENGINE|ANEDOT)\b/i;
+function groupTnLedgerRows(rows, { conduit = false } = {}) {
+  const map = new Map();
+  let total = 0, count = 0, conduitTotal = 0, conduitCount = 0;
+  for (const r of rows || []) {
+    const key = (r.name || "").trim() || "(unknown)";
+    const mapKey = key.toUpperCase(); // case-insensitive grouping — filings format the same name differently
+    const amt = Number(r.amount) || 0;
+    if (conduit && TN_CONDUIT_RE.test(mapKey)) { conduitTotal += amt; conduitCount++; continue; }
+    if (!map.has(mapKey)) map.set(mapKey, { name: key, total: 0, count: 0 }); // keeps first-seen casing
+    const g = map.get(mapKey); g.total += amt; g.count++;
+    total += amt; count++;
+  }
+  const groups = [...map.values()].sort((a, b) => b.total - a.total);
+  return { groups, total: Math.round(total), count, conduitTotal: Math.round(conduitTotal), conduitCount };
+}
+
+// Group itemized rows by their already-computed classifyPayee `type` (Individual/Business/Merchant/
+// Committee-Politician/Party/Other) — powers the dossier's "By type" money-flow breakdown.
+function groupTnByType(rows) {
+  const map = new Map();
+  for (const r of rows || []) {
+    const t = r.type || "Other";
+    if (!map.has(t)) map.set(t, { name: t, total: 0, count: 0 });
+    const g = map.get(t); g.total += (r.amount || 0); g.count++;
+  }
+  return [...map.values()].sort((a, b) => b.total - a.total).map((g) => ({ ...g, total: Math.round(g.total) }));
+}
 
 // ---- TN entity AI profiling ----
 app.post("/api/tn/profile", analyzeLimiter, async (req, res) => {
@@ -2455,7 +3306,12 @@ app.post("/api/ask", analyzeLimiter, async (req, res) => {
   res.setHeader("Cache-Control", "no-cache");
   const send = (obj) => { try { res.write(JSON.stringify(obj) + "\n"); } catch { /* client gone */ } };
   let aborted = false;
-  req.on("close", () => { aborted = true; }); // disconnected client — don't keep burning Ollama calls
+  // NOTE: must be res.on("close"), not req.on("close") — for a POST with a small JSON body, the
+  // *request* stream (req) finishes being read (and can emit "close") almost immediately, well
+  // before the streamed response is done, which was firing this on every request a moment after it
+  // started and aborting the whole dossier/answer. res.on("close") only fires when the underlying
+  // connection actually drops (real client disconnect) or once the response has fully flushed.
+  res.on("close", () => { aborted = true; }); // disconnected client — don't keep burning Ollama calls
 
   if (!forceRefresh) {
     const hit = aiSummaryGet("ask", entityId, model);
@@ -2469,7 +3325,11 @@ app.post("/api/ask", analyzeLimiter, async (req, res) => {
 
   try {
     const r = await runAskAgent({ ctx, question: q, send, isAborted: () => aborted });
-    if (r.aborted) return; // client gone — nothing to send or cache (finally still ends the stream)
+    // `send` no-ops if the client is truly gone, so it's always safe to emit a final event here as
+    // a last-resort safety net even though res.on("close") above should now only fire on a real
+    // disconnect — without this, a stream ending with nothing sent renders as a confusing
+    // "No answer was produced" with zero explanation.
+    if (r.aborted) { send({ type: "error", message: "Request stopped before an answer was produced." }); return; }
     if (r.toolsRun === 0 && !r.isRealAnswer) {
       send({ type: "error", message:
         `The agent model "${model}" didn't call any of the research tools — it replied: "${(r.answer || "(empty)").slice(0, 160)}". This usually means the selected model doesn't reliably support tool-calling in your Ollama. In ⚙ Admin → "Ask AI agent" try a strong tool-caller like qwen2.5:14b or llama3.1:8b (run "ollama pull" first), or update Ollama.` });
@@ -2580,7 +3440,12 @@ async function handleDonorAgent(req, res, { kind, entityId, question, promptHash
   res.setHeader("Cache-Control", "no-cache");
   const send = (obj) => { try { res.write(JSON.stringify(obj) + "\n"); } catch { /* client gone */ } };
   let aborted = false;
-  req.on("close", () => { aborted = true; }); // disconnected client — don't keep burning Ollama calls
+  // NOTE: must be res.on("close"), not req.on("close") — for a POST with a small JSON body, the
+  // *request* stream (req) finishes being read (and can emit "close") almost immediately, well
+  // before the streamed response is done, which was firing this on every request a moment after it
+  // started and aborting the whole dossier/answer. res.on("close") only fires when the underlying
+  // connection actually drops (real client disconnect) or once the response has fully flushed.
+  res.on("close", () => { aborted = true; }); // disconnected client — don't keep burning Ollama calls
 
   if (!forceRefresh) {
     const hit = aiSummaryGet(kind, entityId, model);
@@ -2598,7 +3463,7 @@ async function handleDonorAgent(req, res, { kind, entityId, question, promptHash
       tools: DONOR_TOOLS, execTool: executeDonorTool,
       systemPrompt: donorSystemPrompt(ctx), nudgeText: donorNudgeText(ctx.name),
     });
-    if (r.aborted) return; // client gone — nothing to send or cache (finally still ends the stream)
+    if (r.aborted) { send({ type: "error", message: "Request stopped before an answer was produced." }); return; }
     if (r.toolsRun === 0 && !r.isRealAnswer) {
       send({ type: "error", message:
         `The agent model "${model}" didn't call any of the research tools — it replied: "${(r.answer || "(empty)").slice(0, 160)}". This usually means the selected model doesn't reliably support tool-calling in your Ollama. In ⚙ Admin → "Ask AI agent" try a strong tool-caller like qwen2.5:14b or llama3.1:8b (run "ollama pull" first), or update Ollama.` });
@@ -2727,7 +3592,9 @@ app.post("/api/dossier", analyzeLimiter, async (req, res) => {
   res.setHeader("Cache-Control", "no-cache");
   const send = (o) => { try { res.write(JSON.stringify(o) + "\n"); } catch { /* client gone */ } };
   let aborted = false;
-  req.on("close", () => { aborted = true; }); // disconnected client — stop between phases, don't cache a partial
+  // NOTE: must be res.on("close"), not req.on("close") — see /api/ask for why req's "close" fires
+  // almost immediately for a small POST body, independent of the streamed response's lifetime.
+  res.on("close", () => { aborted = true; }); // disconnected client — stop between phases, don't cache a partial
 
   if (!forceRefresh) {
     const hit = aiSummaryGet("dossier", entityId, model);
@@ -2747,7 +3614,7 @@ app.post("/api/dossier", analyzeLimiter, async (req, res) => {
     const fin = await executeAskTool("fec_finances", {}, ctx);
     dossier.totals = (fin && !fin.error) ? fin : null;
 
-    if (aborted) return;
+    if (aborted) { send({ type: "error", message: "Request stopped before the dossier finished." }); return; }
     // Race roster — every funded candidate in this race (the same data the Money Race shows),
     // so the dossier lists who else is running in the district/state.
     if (office !== "P") {
@@ -2763,7 +3630,7 @@ app.post("/api/dossier", analyzeLimiter, async (req, res) => {
       } catch { dossier.race = null; }
     }
 
-    if (aborted) return;
+    if (aborted) { send({ type: "error", message: "Request stopped before the dossier finished." }); return; }
     send({ type: "phase", note: "Pulling up to 1,000 itemized donors…" });
     const { committeeId: cid, rows, count } = await fetchTopDonors(ctx, 1000);
     if (cid) ctx.committeeId = cid;
@@ -2777,7 +3644,7 @@ app.post("/api/dossier", analyzeLimiter, async (req, res) => {
       topDonors: groups.slice(0, 25).map((g) => ({ name: g.name, employer: g.employer, state: g.state, amount: Math.round(g.total), count: g.count })),
     };
 
-    if (aborted) return;
+    if (aborted) { send({ type: "error", message: "Request stopped before the dossier finished." }); return; }
     if (deduped.length) {
       send({ type: "phase", note: `Analyzing ${groups.length} donors with AI…` });
       const topLines = groups.slice(0, 40).map((g) => `${g.name || "?"} | ${g.state || ""} | ${g.employer || ""} | ${g.occupation || ""} | $${Math.round(g.total)} (${g.count} gift${g.count === 1 ? "" : "s"})`).join("\n");
@@ -2793,7 +3660,7 @@ Write a 180-260 word analysis of where the money comes from: dominant industries
       try { dossier.donors.analysis = await narrate(prompt); } catch (e) { dossier.donors.analysisError = e.message; }
     }
 
-    if (aborted) return;
+    if (aborted) { send({ type: "error", message: "Request stopped before the dossier finished." }); return; }
     send({ type: "phase", note: "Pulling spending (Schedule B)…" });
     const sp = await executeAskTool("fec_spending", {}, ctx);
     dossier.spending = (sp && !sp.error) ? sp : null;
@@ -2806,19 +3673,19 @@ Write 2-3 sentences on what the campaign is prioritizing and any notable pattern
       try { dossier.spending.analysis = await narrate(prompt); } catch { /* leave without narrative */ }
     }
 
-    if (aborted) return;
+    if (aborted) { send({ type: "error", message: "Request stopped before the dossier finished." }); return; }
     send({ type: "phase", note: "Pulling outside money (Schedule E)…" });
     const om = await executeAskTool("fec_outside_money", {}, ctx);
     dossier.outside = (om && !om.error) ? om : null;
 
-    if (aborted) return;
+    if (aborted) { send({ type: "error", message: "Request stopped before the dossier finished." }); return; }
     send({ type: "phase", note: "Researching background & positions…" });
     try {
       const r = await runAskAgent({
         ctx, send, isAborted: () => aborted,
         question: `Produce a concise dossier on ${displayName}: who they are (background, current/past office held), their top policy priorities and positions, and any notable recent news or controversies. Cite sources.`,
       });
-      if (r.aborted) return;
+      if (r.aborted) { send({ type: "error", message: "Request stopped before the dossier finished." }); return; }
       const ok = r.isRealAnswer && r.toolsRun > 0; // no tools called ⇒ ungrounded (deferral/hallucination)
       dossier.research = ok
         ? { available: true, answer: r.answer, sources: r.sources }
@@ -2844,13 +3711,17 @@ app.post("/api/tn/dossier", analyzeLimiter, async (req, res) => {
 
   const model = getAgentModel();
   const key = tnId || String(name).toUpperCase().replace(/[^A-Z0-9]/g, "").slice(0, 48);
-  const entityId = `${key}|${searchConfigured() ? "w" : "n"}|v2`;
+  // v3: added dossier.money (itemized received/spent, top donors/vendors, by-type breakdown, AI
+  // analysis) — bumped so previously-cached tn-dossiers (money-flow-free) regenerate automatically.
+  const entityId = `${key}|${searchConfigured() ? "w" : "n"}|v3`;
 
   res.setHeader("Content-Type", "application/x-ndjson");
   res.setHeader("Cache-Control", "no-cache");
   const send = (o) => { try { res.write(JSON.stringify(o) + "\n"); } catch { /* client gone */ } };
   let aborted = false;
-  req.on("close", () => { aborted = true; }); // disconnected client — stop between phases, don't cache a partial
+  // NOTE: must be res.on("close"), not req.on("close") — see /api/ask for why req's "close" fires
+  // almost immediately for a small POST body, independent of the streamed response's lifetime.
+  res.on("close", () => { aborted = true; }); // disconnected client — stop between phases, don't cache a partial
 
   if (!forceRefresh) {
     const hit = aiSummaryGet("tn-dossier", entityId, model);
@@ -2865,7 +3736,47 @@ app.post("/api/tn/dossier", analyzeLimiter, async (req, res) => {
       catch (e) { dossier.reportsError = e.message; }
     }
 
-    if (aborted) return;
+    if (aborted) { send({ type: "error", message: "Request stopped before the dossier finished." }); return; }
+    if (tnId && /^\d{1,12}$/.test(String(tnId))) {
+      send({ type: "phase", note: "Pulling itemized money flows…" });
+      try {
+        const led = await tnLedgerData(tnId, name, forceRefresh);
+        const byDonor = groupTnLedgerRows(led.contribs, { conduit: true });
+        const byVendor = groupTnLedgerRows(led.expenditures);
+        dossier.money = {
+          totalReceived: led.totalReceived, totalSpent: led.totalSpent,
+          reportsRead: led.reportsRead, reportsTotal: led.reportsTotal, partial: led.partial,
+          ...(led.note ? { note: led.note } : {}),
+          conduitTotal: byDonor.conduitTotal, conduitCount: byDonor.conduitCount,
+          topDonors: byDonor.groups.slice(0, 25).map((g) => ({ name: g.name, amount: Math.round(g.total), count: g.count })),
+          topVendors: byVendor.groups.slice(0, 25).map((g) => ({ name: g.name, amount: Math.round(g.total), count: g.count })),
+          byTypeReceived: groupTnByType(led.contribs),
+          byTypeSpent: groupTnByType(led.expenditures),
+        };
+        if (aborted) { send({ type: "error", message: "Request stopped before the dossier finished." }); return; }
+        if (byDonor.groups.length || byVendor.groups.length) {
+          send({ type: "phase", note: "Analyzing money flows with AI…" });
+          const topLines = byDonor.groups.slice(0, 40)
+            .map((g) => `${g.name} | $${Math.round(g.total)} (${g.count} gift${g.count === 1 ? "" : "s"})`).join("\n");
+          const vendorLines = byVendor.groups.slice(0, 20)
+            .map((g) => `${g.name} | $${Math.round(g.total)}`).join("\n");
+          const prompt = `Analyze Tennessee state campaign finance filings for "${name}" (itemized from actual filed reports; WinRed/ActBlue/Democracy Engine/Anedot conduit pass-throughs already excluded from donors and reported separately).
+
+Totals: received $${led.totalReceived.toLocaleString()} across ${led.reportsRead} of ${led.reportsTotal} filed reports read; spent $${led.totalSpent.toLocaleString()}. Conduit pass-through: $${Math.round(byDonor.conduitTotal).toLocaleString()} across ${byDonor.conduitCount} gifts.
+
+Top donors (name | total | gifts):
+${topLines || "(none itemized)"}
+
+Top vendors/expenditures (name | total):
+${vendorLines || "(none itemized)"}
+
+Write a 150-220 word analysis of where the money comes from and where it goes: notable donor clusters (individuals vs PACs/committees vs businesses), reliance on conduit/small-dollar processors, and what the spending pattern suggests about the campaign's priorities. Factual, neutral, plain prose — no markdown.`;
+          try { dossier.money.analysis = await narrate(prompt); } catch (e) { dossier.money.analysisError = e.message; }
+        }
+      } catch (e) { dossier.moneyError = e.message; }
+    }
+
+    if (aborted) { send({ type: "error", message: "Request stopped before the dossier finished." }); return; }
     send({ type: "phase", note: "Researching the entity…" });
     const ctx = { name, state: "TN", office: "", party: "", cycle: String(new Date().getFullYear()), candidateId: "", committeeId: "", freshSearch: forceRefresh };
     try {
@@ -2873,7 +3784,7 @@ app.post("/api/tn/dossier", analyzeLimiter, async (req, res) => {
         ctx, send, isAborted: () => aborted,
         question: `Produce a concise profile of the Tennessee political entity "${name}": what kind of entity it is (candidate, PAC, party committee), who or what it represents, its apparent priorities, and any notable recent news. Use Tennessee registry records, Wikipedia, news, and web search. Cite sources.`,
       });
-      if (r.aborted) return;
+      if (r.aborted) { send({ type: "error", message: "Request stopped before the dossier finished." }); return; }
       const ok = r.isRealAnswer && r.toolsRun > 0;
       dossier.research = ok
         ? { available: true, answer: r.answer, sources: r.sources }
