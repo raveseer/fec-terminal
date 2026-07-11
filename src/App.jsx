@@ -503,12 +503,14 @@ const css = `
   .fec-check input { accent-color:var(--brass); }
   .fec-hint { color:var(--muted); font-size:11px; max-width:420px; }
 
-  .fec-tabs { margin-top:26px; display:flex; border-bottom:1px solid var(--line); }
+  .fec-tabs { margin-top:26px; display:flex; border-bottom:1px solid var(--line);
+    overflow-x:auto; -webkit-overflow-scrolling:touch; scrollbar-width:none; }
+  .fec-tabs::-webkit-scrollbar { display:none; }
   .fec-tab {
     background:none; border:none; color:var(--muted); font:inherit;
     font-family:'Barlow Condensed', sans-serif; font-weight:600; font-size:16px;
     letter-spacing:.08em; text-transform:uppercase; padding:8px 18px; cursor:pointer;
-    border-bottom:2px solid transparent; margin-bottom:-1px;
+    border-bottom:2px solid transparent; margin-bottom:-1px; white-space:nowrap; flex-shrink:0;
   }
   .fec-tab[aria-selected="true"] { color:var(--brass); border-bottom-color:var(--brass); }
 
@@ -564,7 +566,9 @@ const css = `
   .fec-ledger-head .close:hover { color:var(--bone); border-color:var(--bone); }
   .fec-ledger-bar { display:flex; gap:10px; align-items:center; flex-wrap:wrap; padding:10px 16px; border-bottom:1px solid var(--line); background:var(--panel2); }
 
-  .fec-table-wrap { overflow-x:auto; }
+  .fec-table-wrap { overflow-x:auto; -webkit-overflow-scrolling:touch; }
+  .fec-flow-scroll { overflow-x:auto; -webkit-overflow-scrolling:touch; }
+  .fec-flow-svg { width:100%; min-width:760px; display:block; }
   table.fec-table { width:100%; border-collapse:collapse; font-size:12px; }
   .fec-table th {
     text-align:left; font-size:10px; letter-spacing:.12em; text-transform:uppercase; font-weight:500;
@@ -640,6 +644,20 @@ const css = `
   }
   @media (max-width: 640px) {
     .fec-race-row { grid-template-columns:1fr; gap:6px; }
+    .fec-tab { font-size:14px; padding:8px 12px; }
+    .fec-controls { padding:12px; gap:10px; }
+    .fec-btn { padding:9px 18px; font-size:15px; }
+    .fec-ledger-head { padding:10px 12px; gap:8px; }
+    .fec-ledger-head .fec-name { font-size:17px; }
+    .fec-ledger-bar { padding:8px 12px; }
+    .fec-table th, .fec-table td { padding:6px 8px; }
+    .fec-flow-svg { min-width:620px; }
+    .fec-profile { padding:12px; }
+    .fec-ai { padding:12px; }
+    .fec-modal-overlay { padding:10px 6px; }
+    .fec-modal-body { padding:12px 12px 18px; }
+    .fec-hint { max-width:100%; }
+    .fec-status { flex-direction:column; align-items:flex-start; gap:8px; }
   }
 
   /* ---------- responsive layout ---------- */
@@ -3076,12 +3094,16 @@ function OverlapPanel({ ov, onClose, onRerun }) {
 // [where donors also give] [donors in] [CENTER] [money out] [who else pays / co-donors].
 // Edge width ∝ √amount; click any non-center node to re-center on it (breadcrumb Back).
 const FLOW_KIND_COLOR = { committee: "var(--brass)", donor: "var(--bone)", org: "var(--rose)", conduit: "var(--muted)", payee: "var(--olive)" };
-function FlowGraph({ committeeId = "", donorKey = "", name = "", cycle = "", bare = false }) {
+// tnPull (optional {id, name}): TN entities can't Trace FEC — instead a "⤢ Pull TN reports"
+// button feeds the ledger through /api/tn/ledger (which parses + ingests the entity's filed
+// reports) and then redraws the graph.
+function FlowGraph({ committeeId = "", donorKey = "", name = "", cycle = "", bare = false, tnPull = null }) {
   const [center, setCenter] = useState({ committeeId, donorKey, name });
   const [trail, setTrail] = useState([]); // previous centers, for ◂ Back
   const [st, setSt] = useState({ loading: true }); // {loading} | {data} | {error}
   const [allCycles, setAllCycles] = useState(!cycle);
   const [tracing, setTracing] = useState(false);
+  const [tnPulling, setTnPulling] = useState(false);
   const [sel, setSel] = useState(null); // clicked node/edge → {donorKey?, committeeId?, kind?, label, node?}
   const [selRows, setSelRows] = useState(null); // {loading} | {data} | {error} — itemized rows for sel
   const genRef = useRef(0); // generation token — a re-center mid-flight must not clobber
@@ -3229,18 +3251,34 @@ function FlowGraph({ committeeId = "", donorKey = "", name = "", cycle = "", bar
             {tracing ? "Tracing…" : "⤢ Trace FEC"}
           </button>
         )}
+        {tnPull && center.committeeId === String(tnPull.id) && (
+          <button className="fec-btn ghost sm" disabled={tnPulling || st.loading}
+            title="Parse this entity's filed TREF reports into the ledger (itemized contributions + expenditures), then redraw"
+            onClick={async () => {
+              setTnPulling(true);
+              try {
+                await fetch(`/api/tn/ledger?id=${encodeURIComponent(tnPull.id)}&owner=${encodeURIComponent(tnPull.name || "")}`);
+              } catch { /* the reload below surfaces whatever state we're in */ }
+              setTnPulling(false);
+              load(center);
+            }}>
+            {tnPulling ? "Pulling reports…" : "⤢ Pull TN reports"}
+          </button>
+        )}
       </div>
       {st.loading && <div className="fec-spin" style={{ margin: 12 }}>Building flow graph…</div>}
       {st.error && <div className="fec-error" role="alert" style={{ margin: 12 }}>{st.error}</div>}
       {data && !drawable && !st.loading && (
         <div className="fec-empty" style={{ margin: 12 }}>
           Nothing stored to draw yet
-          {center.committeeId ? " — hit ⤢ Trace FEC to pull this committee's top receipts and spending" : " — run a donor search first so gifts land in the ledger"}.
+          {tnPull && center.committeeId === String(tnPull.id)
+            ? " — hit ⤢ Pull TN reports to parse this entity's filed reports into the ledger"
+            : center.committeeId ? " — hit ⤢ Trace FEC to pull this committee's top receipts and spending" : " — run a donor search first so gifts land in the ledger"}.
         </div>
       )}
       {data && drawable && (
-        <div style={{ overflowX: "auto" }}>
-          <svg viewBox={`0 0 ${W} ${H}`} style={{ width: "100%", minWidth: 760, display: "block", fontFamily: "inherit" }}
+        <div className="fec-flow-scroll">
+          <svg viewBox={`0 0 ${W} ${H}`} className="fec-flow-svg" style={{ fontFamily: "inherit" }}
             role="img" aria-label="Money-flow graph">
             {edges.map((e, i) => {
               const p1 = pos.get(e.from), p2 = pos.get(e.to);
@@ -3402,7 +3440,7 @@ function PatternsPanel({ committeeId, candidateId, name, cycle, raceState }) {
       <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap", padding: "10px 16px", borderBottom: "1px solid var(--line)" }}>
         <span className="fec-ai-label" style={{ marginBottom: 0 }}>Giving patterns</span>
         <span className="fec-tag">{name}</span>
-        <span style={{ display: "flex", gap: 4, flexWrap: "wrap", marginLeft: "auto" }} role="tablist">
+        <span className="fec-tab-nav" role="tablist" style={{ marginLeft: "auto", minWidth: 0, flexShrink: 1, maxWidth: "100%" }}>
           {TABS.map(([id, label]) => (
             <button key={id} className="fec-tab" role="tab" aria-selected={tab === id}
               onClick={() => setTab(id)} style={{ fontSize: 11, padding: "4px 10px" }}>{label}</button>
@@ -4669,6 +4707,7 @@ function TnPanel({ seed }) {
   const [recvView, setRecvView] = useState({}); // rowIdx -> raw | donors | employers | filings
   const [spentView, setSpentView] = useState({}); // rowIdx -> raw | vendors | filings
   const [lastFiled, setLastFiled] = useState({}); // tnId -> {loading, date, error}
+  const [flowsOpen, setFlowsOpen] = useState({}); // tnId -> bool (money-flow graph, mirrors the FEC tab's Flows ▸)
   const [localFilter, setLocalFilter] = useState(""); // client-side substring filter on results
   // donor reverse lookup
   const [donorMode, setDonorMode] = useState(false);
@@ -4733,7 +4772,7 @@ function TnPanel({ seed }) {
     const nm = typeof overrideName === "string" ? overrideName : name; // drill-through passes the clicked name before state settles
     if (!nm && !office && !year) { setError("Provide at least a name, office, or election year."); return; }
     setLoading(true); setError(null); setReports({}); setAiProfiles({}); setMoney({}); setMoneyTab({}); setTrends({}); setLastFiled({}); setLocalFilter("");
-    setActivity({}); setLedger({}); setLedgerYear({}); setRecvView({}); setSpentView({}); // index-keyed per-row state — stale across result sets
+    setActivity({}); setLedger({}); setLedgerYear({}); setRecvView({}); setSpentView({}); setFlowsOpen({}); // index-keyed per-row state — stale across result sets
     try {
       const qs = new URLSearchParams({ name: nm, office, year, type });
       if (forceRefresh) qs.set("_refresh", "1");
@@ -4787,7 +4826,7 @@ function TnPanel({ seed }) {
   };
   const runHistorySearch = async (s, force) => {
     setLoading(true); setError(null); setReports({}); setAiProfiles({}); setMoney({}); setMoneyTab({}); setTrends({}); setLastFiled({}); setLocalFilter("");
-    setActivity({}); setLedger({}); setLedgerYear({}); setRecvView({}); setSpentView({}); // index-keyed per-row state — stale across result sets
+    setActivity({}); setLedger({}); setLedgerYear({}); setRecvView({}); setSpentView({}); setFlowsOpen({}); // index-keyed per-row state — stale across result sets
     try {
       const qs = new URLSearchParams({ name: s.name || "", office: s.office || "", year: s.year || "", type: s.type || "both" });
       if (force) qs.set("_refresh", "1");
@@ -5964,9 +6003,22 @@ function TnPanel({ seed }) {
                                 {rp?.loading ? "…" : rp?.open ? "Hide ▾" : "Reports ▸"}
                               </button>
                             )}
+                            {r.tnId && (
+                              <button className="fec-btn ghost sm" aria-expanded={!!flowsOpen[r.tnId]}
+                                onClick={() => setFlowsOpen((p) => ({ ...p, [r.tnId]: !p[r.tnId] }))}
+                                title="Money-flow graph — who funds this entity, where its money goes, and where its donors also give (click any node or edge to itemize)">
+                                {flowsOpen[r.tnId] ? "Close ▾" : "Flows ▸"}
+                              </button>
+                            )}
                             <DossierButton sm endpoint="/api/tn/dossier" payload={{ tnId: r.tnId || "", name: entityName(r) }} />
                           </div>
                         </div>
+                        {r.tnId && flowsOpen[r.tnId] && (
+                          <div style={{ marginBottom: 6 }}>
+                            <FlowGraph key={`tnflow-${r.tnId}`} committeeId={String(r.tnId)}
+                              name={entityName(r)} cycle="" tnPull={{ id: r.tnId, name: entityName(r) }} />
+                          </div>
+                        )}
                         {mp?.open && (
                           <div className="fec-profile" style={{ borderLeftColor: "var(--brass)", marginBottom: 6 }}>
                             <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
