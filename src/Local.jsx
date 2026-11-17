@@ -384,7 +384,7 @@ export default function Local() {
           <div style={{ padding: "12px 16px" }}>
             <h3 className="tx-h" style={{ margin: 0 }}>Waiting for a person</h3>
             <div className="tx-note" style={{ marginTop: 4 }}>
-              {queue ? <>{fmtNum(queue.total)} rows worth {fmtUSD(queue.amount)} in {fmtNum(queue.docCount)} reports are held out of every total.</> : "Loading."} A report lands here when the readers disagreed, a name or amount could not be confirmed a second way, or the form’s own totals did not add up — for its rows or for its receipts and balance figures. Open one to compare with the page.
+              {queue ? <>{fmtNum(queue.docCount)} report{queue.docCount === 1 ? "" : "s"} to look at; {fmtNum(queue.total)} row{queue.total === 1 ? "" : "s"} worth {fmtUSD(queue.amount)} {queue.total === 1 ? "is" : "are"} held out of every total.</> : "Loading."} A report lands here when the readers disagreed, a name or amount could not be confirmed a second way, or the form’s own totals did not add up — for its rows or for its receipts and balance figures. Open one to compare with the page.
             </div>
           </div>
           <div className="fec-table-wrap" style={{ maxHeight: 640, overflowY: "auto" }}>

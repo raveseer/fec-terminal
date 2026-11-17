@@ -104,11 +104,13 @@ export function registerLocal(app) {
     CREATE INDEX IF NOT EXISTS idx_local_item_norm ON local_item(norm);
     CREATE INDEX IF NOT EXISTS idx_local_item_review ON local_item(review) WHERE review = 'pending';
   `);
-  try { db.exec("ALTER TABLE local_doc ADD COLUMN needs_review INTEGER DEFAULT 0"); } catch { /* already there */ }
   const seed = db.prepare("INSERT OR IGNORE INTO local_source (sub, customer_id, county) VALUES (?, ?, ?)");
   for (const [sub, cid, county] of KNOWN_SOURCES) seed.run(sub, cid, county);
+  try { db.exec("ALTER TABLE local_doc ADD COLUMN needs_review INTEGER DEFAULT 0"); } catch { /* already there */ }
   // a crash mid-read leaves rows marked as in progress
   db.exec("UPDATE local_doc SET extract_status = 'none' WHERE extract_status IN ('queued','reading')");
+  // reports read before the review flag existed
+  db.exec(`UPDATE local_doc SET needs_review = 1 WHERE extract_status = 'done' AND needs_review = 0 AND (totals LIKE '%"verified":false%' OR (flags IS NOT NULL AND flags != '[]'))`);
 
   const tx = (fn) => { db.exec("BEGIN"); try { const r = fn(); db.exec("COMMIT"); return r; } catch (e) { try { db.exec("ROLLBACK"); } catch { /* already closed */ } throw e; } };
   const sources = () => db.prepare("SELECT * FROM local_source ORDER BY county").all();
