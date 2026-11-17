@@ -280,3 +280,32 @@ portal (`<county>countytn.easyvotecampaignfinance.com`, API `ecf-api.easyvoteapp
 the checks; pure functions are unit-tested). Portal rows are replaced on each sync; rows read from a
 PDF never override them — for a report that has both, the PDF only supplies address, employer,
 purpose and a missing date. A person's review decisions survive re-reading.
+
+## 9. State money out, votes, disclosures, results (v4.4.0)
+
+`server/tnstate.js`, `server/xlsx.js`, `src/State.jsx`. Each source below was fetched and its
+structure checked, Nov 2026.
+
+| What | Source | How it is read |
+|---|---|---|
+| FastTrack grants | tn.gov/ecd OpenECD | dated `.xlsx` linked from the page (contracted) + HTML table (pending) |
+| State contracts | Central Procurement Office "All Contracts" | Tableau view exported as CSV: `data.tn.gov/t/Public/views/CPOContractDetails/CPOContracts-ADACompliant.csv?:maxrows=0` |
+| Election results | sos.tn.gov/elections/results | `YYYYMMDDAllbyPrecinct.xlsx`, wide format (RNAME1..n / PVTALLY1..n), summed to county |
+| Bill votes | wapp.capitol.tn.gov BillInfo | the Votes tab text ("Representatives voting Aye were: …") |
+| Disclosures of interests | conflict.app.tn.gov | form POST (a report year is required) then `view_form_8004/8005.htm`, split on `<h2>` |
+| Nonprofit filings | ProPublica Nonprofit Explorer API v2 | JSON |
+
+**Tried and not usable.**
+- Searchable Checkbook (vendor payments): the Tableau workbook only exports agency-level summaries
+  (`Agency.csv`, `Vendor.csv`); the payee drill-down is not reachable by URL, and the agency total
+  it returned for the current fiscal year ($715M) is too small to be all payments, so nothing from
+  it is shown. Contracts carry the vendor names instead, as ceilings rather than payments.
+- `cached()` in tnx.js spreads its value into an object: cache objects, not bare arrays.
+
+**Organization matching** is by `normalizeEmployerName` (suffixes dropped). It misses subsidiaries
+and PACs whose name does not start with the company's (EASTMANPAC vs Eastman Chemical) and merges
+unrelated organizations that share a name.
+
+**Not built:** vendor-level state payments; county and city government spending and Comptroller
+audit findings; federal earmarks; a member's full voting record across bills (votes are per bill);
+state-office cost per vote; identity merging on the Donors tab; a faster model for typed pages.

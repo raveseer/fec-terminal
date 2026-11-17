@@ -1,4 +1,4 @@
-# FEC Records Terminal v4.3
+# FEC Records Terminal v4.4
 
 Self-hosted explorer for the OpenFEC API with local-AI donor analysis and Tennessee
 state-records search.
@@ -27,7 +27,7 @@ state-records search.
   are cached + force-refreshable. Needs a tool-capable model (`OLLAMA_TOOL_MODEL`, default
   `mistral-small3.2:latest`, selectable in Admin); web search is optional (`SEARCH_API_KEY`) and
   degrades to FEC/TN/Wikipedia/news when unset.
-- **Tennessee tab** — twelve ways into Tennessee money, all sharing one cache:
+- **Tennessee tab** — fourteen ways into Tennessee money, all sharing one cache:
   - *Candidate* — type a name, pick the matching federal committees (principal, joint
     fundraising, leadership PAC) and state account, and open one page: merged donor list
     (federal $ / state $ / total, identities merged, CSV), where the money comes from (state,
@@ -39,11 +39,20 @@ state-records search.
     filings through one vendor portal; this section indexes every filer and document there,
     loads the itemized rows of reports filed online, reads PDF-only reports by machine, and
     holds anything uncertain in a review queue. See "Local filings" below.
-  - *Outside spending* — state independent expenditures by candidate, for and against.
+  - *State dollars* — FastTrack economic-development grants by company and county, and the
+    state's contracts in force by supplier. Any name opens an **organization page**: incentives,
+    contracts, lobbying registration, federal awards in Tennessee, where its employees give, and
+    what it or its PAC gives — federal, state and local together.
+  - *Results* — Secretary of State precinct results rolled up to county, per race; a candidate's
+    name opens their donors.
+  - *Outside spending* — state independent expenditures by candidate, for and against, plus an
+    IRS-filing lookup for the nonprofits behind them.
   - *By place* — pick a ZIP, county or city: who there gives, and to whom (state + federal).
   - *Lobbying* — the Ethics Commission roster: employers of lobbyists, lobbyists, who lobbies
     for whom by year.
-  - *Legislature* — General Assembly members, committee assignments, sponsored bills.
+  - *Legislature* — General Assembly members, committee assignments, sponsored bills, how each
+    member voted on a bill (committee and floor), and officials' Statements of Disclosure of
+    Interests (sources of income, positions, investments).
   - *Registry* — per-entity workspace on the Tennessee Registry of Election Finance (TREF,
     apps.tn.gov/tncamp): report lists, itemized ledgers, money flows, AI profiles, tracking.
     Name search is a single `%wildcard` contains-match; filters for office, district, party,
@@ -100,6 +109,9 @@ small3.2` reads again as the second opinion and arranges text pages; change them
 a text page seconds, so the reader runs as a background queue (Local → Counties and reader) and
 starts with your own counties. PDFs are cached under `data/local-pdf` (1.5 GB cap,
 `LOCAL_PDF_CACHE_MB`).
+
+Counties that are not online: Local → Counties and reader → upload a PDF you obtained by records
+request; it is stored under `data/local-upload` and goes through the same reader and review.
 
 Limits: the county search exposes names, dates and amounts only — addresses and employers arrive
 when the PDF is read. Handwriting is the weak point; expect most handwritten rows to land in
@@ -214,6 +226,12 @@ the initial default).
   `/api/tn/local/filer/:id`, `/api/tn/local/search?q=&kind=out`, `/api/tn/local/doc/:id` (+ `/pdf`,
   `/page/:n`, `POST /read|review|add`), `POST /api/tn/local/item/:id`, `/api/tn/local/review`,
   `GET|POST /api/tn/local/reader[/start|/stop|/models]`
+- `POST /api/tn/local/upload?county=&filer=&office=&name=&filed=` (PDF body), `/api/tn/local/match?name=`,
+  `/api/tn/local/place?zip=|city=`
+- `/api/tn/state/incentives?q=&county=`, `/api/tn/state/contracts?q=&type=`, `/api/tn/org?name=`
+- `/api/tn/results/elections`, `/api/tn/results?election=YYYYMMDD&office=&type=&county=`
+- `/api/tn/legislature/bill?number=&ga=`, `/api/tn/interests?last=&year=&scope=`, `/api/tn/interests/view`
+- `/api/tn/nonprofit?q=|ein=`
 - `/api/tn/lobby?q=`, `/api/tn/lobby/employer/:id`, `/api/tn/lobby/lobbyist/:id`
 - `/api/tn/legislature`, `/api/tn/legislature/member?chamber=H|S&district=`
 - `GET|POST /api/tn/auto`, `POST /api/tn/auto/run`

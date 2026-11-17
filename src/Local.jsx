@@ -183,7 +183,7 @@ function FilerPage({ id, onClose, onOpenDoc, refreshKey }) {
         <div style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "baseline", flexWrap: "wrap" }}>
           <h3 style={{ margin: 0 }}>{filer.name} <span className="sub" style={{ fontFamily: "var(--font-ui)", fontWeight: 400 }}>· {filer.office || "office not listed"} · {filer.county} County · {filer.status || ""}</span></h3>
           <span style={{ display: "flex", gap: 8, alignItems: "center" }}>
-            <a className="fec-extlink" href={filer.url} target="_blank" rel="noopener noreferrer">County portal ↗</a>
+            {filer.url && <a className="fec-extlink" href={filer.url} target="_blank" rel="noopener noreferrer">County portal ↗</a>}
             <button className="fec-btn ghost sm" onClick={onClose}>Close</button>
           </span>
         </div>
@@ -251,7 +251,7 @@ function FilerPage({ id, onClose, onOpenDoc, refreshKey }) {
 // =============================================================================================
 //  Section
 // =============================================================================================
-export default function Local() {
+export default function Local({ seed }) {
   const [view, setView] = useState("filers");
   const [src, setSrc] = useState(null); const [err, setErr] = useState(null);
   const [sub, setSub] = useState(""); const [q, setQ] = useState(""); const [office, setOffice] = useState(""); const [active, setActive] = useState(false);
@@ -259,6 +259,21 @@ export default function Local() {
   const [sq, setSq] = useState(""); const [skind, setSkind] = useState("in"); const [found, setFound] = useState(null);
   const [queue, setQueue] = useState(null); const [tick, setTick] = useState(0); const [limit, setLimit] = useState(25);
   const first = useRef(true);
+  const [up, setUp] = useState({ county: "", filer: "", office: "", name: "", filed: "" }); const [upMsg, setUpMsg] = useState(null); const fileRef = useRef(null);
+  useEffect(() => { if (seed?.filerId) { setSub(""); setOffice(""); setQ(""); setDocId(null); setView("filers"); setFilerId(seed.filerId); } }, [seed?.filerId, seed?.t]);
+  const upload = async (e) => {
+    e.preventDefault();
+    const file = fileRef.current?.files?.[0];
+    if (!file) { setUpMsg("Choose a PDF first."); return; }
+    setUpMsg("Uploading…");
+    try {
+      const res = await fetch(`/api/tn/local/upload?${new URLSearchParams(up)}`, { method: "POST", headers: { "content-type": "application/pdf" }, body: file });
+      const d = await res.json();
+      if (!res.ok) throw new Error(d?.error?.message || "Upload failed.");
+      setUpMsg(d.duplicate ? "That file was already uploaded." : d.reading ? "Uploaded. The reader has started on it." : "Uploaded. The reader is busy; open the report and press “Read this report” when it is free.");
+      fileRef.current.value = ""; await loadSrc(); setTick((n) => n + 1); setDocId(d.docId);
+    } catch (x) { setUpMsg(x.message); }
+  };
   const loadSrc = useCallback(() => getJSON("/api/tn/local/sources").then((x) => { setSrc(x); return x; }).catch((e) => setErr(e.message)), []);
   useEffect(() => {
     loadSrc().then((x) => {
@@ -290,14 +305,14 @@ export default function Local() {
   return (
     <>
       <p className="tx-lede">
-        County and city offices — mayors, commissioners, sheriffs, school boards, judges. Local candidates file with their county election commission, and <b>{src ? src.sources.length : "fourteen"} Tennessee counties publish those filings online</b>.
+        County and city offices — mayors, commissioners, sheriffs, school boards, judges. Local candidates file with their county election commission, and <b>{src ? src.sources.filter((s) => !s.uploads).length : "fourteen"} Tennessee counties publish those filings online</b>.
         Reports filed electronically arrive as data; paper reports are scanned PDFs that are read here by machine, with anything uncertain <b>held for you to check</b>.
       </p>
       <div className="tx-panel">
         <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
           <select style={inputStyle} value={sub} onChange={(e) => { setSub(e.target.value); setOffice(""); setFilerId(null); }} aria-label="County">
-            <option value="">All {src?.sources.length || ""} counties</option>
-            {src?.sources.map((s) => <option key={s.sub} value={s.sub}>{s.county} County{s.filers ? ` — ${fmtNum(s.filers)} filers` : ""}</option>)}
+            <option value="">All counties</option>
+            {src?.sources.filter((s) => !s.uploads || s.filers > 0).map((s) => <option key={s.sub} value={s.sub}>{s.uploads ? "Uploaded by you" : `${s.county} County`}{s.filers ? ` — ${fmtNum(s.filers)} filers` : ""}</option>)}
           </select>
           <div className="tx-subnav" role="tablist" aria-label="Local views" style={{ display: "inline-flex", margin: 0 }}>
             {[["filers", "Candidates and committees"], ["search", "Find a donor or payee"], ["review", `Review${pendingAll ? ` (${fmtNum(pendingAll)})` : ""}`], ["sources", "Counties and reader"]].map(([id, label]) => (
@@ -432,6 +447,18 @@ export default function Local() {
               </>
             )}
           </div>
+          <div className="tx-panel">
+            <h3>A report from a county that is not online</h3>
+            <form onSubmit={upload} style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "end" }}>
+              {[["county", "County", 130, true], ["filer", "Candidate or committee (LAST, FIRST)", 240, true], ["office", "Office", 170, false], ["name", "Report (e.g. Pre-General 2026)", 200, false]].map(([k, label, w, req]) => (
+                <label key={k} style={{ fontSize: 11, color: "var(--muted)" }}>{label}<input style={{ ...inputStyle, width: w, display: "block" }} value={up[k]} required={req} onChange={(e) => setUp({ ...up, [k]: e.target.value })} /></label>
+              ))}
+              <label style={{ fontSize: 11, color: "var(--muted)" }}>Date filed<input type="date" style={{ ...inputStyle, display: "block" }} value={up.filed} onChange={(e) => setUp({ ...up, filed: e.target.value })} /></label>
+              <label style={{ fontSize: 11, color: "var(--muted)" }}>PDF<input ref={fileRef} type="file" accept="application/pdf" style={{ display: "block", fontSize: 13, color: "var(--bone)" }} /></label>
+              <button className="fec-btn">Upload and read</button>
+            </form>
+            <div className="tx-note">For reports you get from an election commission by records request. The file stays on this machine and goes through the same reader and review queue. {upMsg && <b>{upMsg}</b>}</div>
+          </div>
           <div className="tx-panel" style={{ padding: 0, overflow: "hidden" }}>
             <div style={{ display: "flex", justifyContent: "space-between", gap: 10, padding: "12px 16px", alignItems: "center", flexWrap: "wrap" }}>
               <h3 className="tx-h" style={{ margin: 0 }}>Counties that publish online</h3>
@@ -445,8 +472,8 @@ export default function Local() {
                 <thead><tr><th>Mine</th><th>County</th><th style={{ textAlign: "right" }}>Filers</th><th style={{ textAlign: "right" }}>Documents</th><th style={{ textAlign: "right" }}>Contributions online</th><th style={{ textAlign: "right" }}>PDF-only reports</th><th style={{ textAlign: "right" }}>Read</th><th style={{ textAlign: "right" }}>To review</th><th>Fetched</th></tr></thead>
                 <tbody>{src.sources.map((s) => (
                   <tr key={s.sub}>
-                    <td><input type="checkbox" aria-label={`Watch ${s.county} County`} checked={src.home.includes(s.sub)} onChange={(e) => post("/api/tn/local/home", { subs: e.target.checked ? [...src.home, s.sub] : src.home.filter((x) => x !== s.sub) }).then(loadSrc)} /></td>
-                    <td><button className="tx-linkbtn" style={{ color: "var(--bone)", fontWeight: 500 }} onClick={() => { setSub(s.sub); setView("filers"); }}>{s.county}</button> <a className="fec-extlink" href={s.url} target="_blank" rel="noopener noreferrer">portal ↗</a>{s.error && <div style={{ color: "var(--warn)", fontSize: 12 }}>{s.error}</div>}</td>
+                    <td>{!s.uploads && <input type="checkbox" aria-label={`Watch ${s.county} County`} checked={src.home.includes(s.sub)} onChange={(e) => post("/api/tn/local/home", { subs: e.target.checked ? [...src.home, s.sub] : src.home.filter((x) => x !== s.sub) }).then(loadSrc)} />}</td>
+                    <td><button className="tx-linkbtn" style={{ color: "var(--bone)", fontWeight: 500 }} onClick={() => { setSub(s.sub); setView("filers"); }}>{s.uploads ? "Uploaded by you" : s.county}</button> {s.url && <a className="fec-extlink" href={s.url} target="_blank" rel="noopener noreferrer">portal ↗</a>}{s.error && <div style={{ color: "var(--warn)", fontSize: 12 }}>{s.error}</div>}</td>
                     <td style={{ textAlign: "right" }}>{fmtNum(s.filers)}</td><td style={{ textAlign: "right" }}>{fmtNum(s.docs)}</td><td style={{ textAlign: "right" }}>{fmtNum(s.contribs)}</td>
                     <td style={{ textAlign: "right" }}>{fmtNum(s.paper)}</td><td style={{ textAlign: "right" }}>{fmtNum(s.read)}{s.failed ? <span style={{ color: "var(--warn)" }}> · {s.failed} failed</span> : ""}</td><td style={{ textAlign: "right" }}>{s.reviewDocs ? fmtNum(s.reviewDocs) : ""}</td>
                     <td className="sub">{s.syncedAt ? timeAgo(s.syncedAt) : "not yet"}</td>
@@ -454,7 +481,7 @@ export default function Local() {
                 ))}</tbody>
               </table>
             </div>
-            <div className="tx-note" style={{ padding: "0 16px 12px" }}>“Mine” counties are re-checked by the automatic Tennessee check (Directory), which alerts on new filings, and are the default for the reader. The other {95 - src.sources.length} counties do not publish filings through this portal; their reports are on paper at each election commission.</div>
+            <div className="tx-note" style={{ padding: "0 16px 12px" }}>“Mine” counties are re-checked by the automatic Tennessee check (Directory), which alerts on new filings, and are the default for the reader. The other {95 - src.sources.filter((s) => !s.uploads).length} counties do not publish filings through this portal; their reports are on paper at each election commission.</div>
           </div>
         </>
       )}

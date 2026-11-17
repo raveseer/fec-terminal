@@ -1,5 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { parseBillVotes } from "../server/tnstate.js";
+import { csvRows, excelDate } from "../server/xlsx.js";
 import { textHasAmount, textHasName, namesAgree, checkRows, checkTotals, repairTotals, pageType } from "../server/localread.js";
 
 test("amount confirmation is literal and does not accept a near miss", () => {
@@ -66,4 +68,19 @@ test("summary repair only accepts a figure that is printed on the page", () => {
   assert.equal(t.disbursements, 6859.15); assert.equal(t.adds, true); assert.equal(t.repaired.field, "disbursements");
   const once = "LAST REPORT $1,232.30 RECEIPTS $6,859.15 BALANCE $1,232.30"; // the figure appears once, and receipts already uses it
   assert.equal(repairTotals(checkTotals({ balance_last: 1232.3, receipts: 6859.15, disbursements: 0, balance: 1232.3 }), once).adds, false);
+});
+
+test("bill votes: committee and floor blocks parse into counts and names", () => {
+  const html = `<asp:Panel ID="pnlHouseVotes" runat="server"><h3>House</h3><p> HB0364 by Alexander - HOUSE INSURANCE COMMITTEE: <br />Rec. for pass; ref to Finance, Ways, and Means Committee 2/26/2025 <br/> Passed<br/>&nbsp;&nbsp;Ayes...............................................18<br/>&nbsp;&nbsp;Noes................................................1<br/><br/>&nbsp;&nbsp;Representatives voting Aye were: Cepicky, Freeman, Jones R -- 3.<br/><br/>&nbsp;&nbsp;Representatives voting No were: Hakeem -- 1.<br/><br/> </p></asp:Panel>
+    <asp:Panel ID="pnlSenateVotes" runat="server"><p> SB0650 by Crowe - FLOOR VOTE: <br />Third Consideration 3/1/2025 <br/> Passed<br/>Ayes................................................9<br/>Noes................................................0<br/><br/>Senators voting Aye were: Crowe, Haile -- 2.<br/><br/></p></asp:Panel>`;
+  const v = parseBillVotes(html);
+  assert.equal(v.length, 2);
+  assert.deepEqual([v[0].chamber, v[0].bill, v[0].body, v[0].date, v[0].ayes, v[0].noes], ["House", "HB0364", "HOUSE INSURANCE COMMITTEE", "2025-02-26", 18, 1]);
+  assert.deepEqual(v[0].aye, ["Cepicky", "Freeman", "Jones R"]); assert.deepEqual(v[0].no, ["Hakeem"]);
+  assert.equal(v[1].bill, "SB0650"); assert.equal(v[1].result, "Passed");
+});
+
+test("csv and excel helpers", () => {
+  assert.deepEqual(csvRows('a,b\n"x, y","1,980,000"\n'), [["a", "b"], ["x, y", "1,980,000"]]);
+  assert.equal(excelDate("44302.208333333336"), "2021-04-16");
 });

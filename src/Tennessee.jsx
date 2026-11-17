@@ -8,6 +8,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { fmtUSD, fmtUSDshort, fmtNum, timeAgo, partyColor, downloadCSV, getJSON } from "./lib.js";
 import Local from "./Local.jsx";
+import { StateDollars, Results, BillVotes, NonprofitLookup, Interests } from "./State.jsx";
 
 const SECTIONS = [
   ["candidate", "Candidate"],
@@ -16,6 +17,8 @@ const SECTIONS = [
   ["money", "Money search"],
   ["filings", "Filings"],
   ["local", "Local"],
+  ["state", "State dollars"],
+  ["results", "Results"],
   ["outside", "Outside spending"],
   ["place", "By place"],
   ["lobby", "Lobbying"],
@@ -1017,7 +1020,7 @@ function CandidateSpending({ body }) {
   );
 }
 
-function CandidateDonors({ onOpenDonor, seed }) {
+function CandidateDonors({ onOpenDonor, seed, onOpenLocal }) {
   const [q, setQ] = useState("");
   const [finding, setFinding] = useState(false);
   const [found, setFound] = useState(null);
@@ -1047,6 +1050,7 @@ function CandidateDonors({ onOpenDonor, seed }) {
     return [...set].sort().reverse().slice(0, 8);
   }, [found, selFed]);
 
+  const [localAcct, setLocalAcct] = useState([]);
   const find = async (override) => {
     const name = (typeof override === "string" ? override : q).trim();
     if (name.length < 2) return;
@@ -1054,6 +1058,7 @@ function CandidateDonors({ onOpenDonor, seed }) {
     try {
       const d = await getJSON(`/api/tn/candidate/find?q=${encodeURIComponent(name)}`);
       setFound(d);
+      getJSON(`/api/tn/local/match?name=${encodeURIComponent(name)}`).then((x) => setLocalAcct(x.filers || [])).catch(() => setLocalAcct([]));
       // preselect the active federal candidacy's principal committee and the most recent state account
       const f = {}; const top = d.federal[0];
       if (top) for (const pc of top.committees) if (pc.role === "principal") f[pc.id] = true;
@@ -1205,6 +1210,7 @@ function CandidateDonors({ onOpenDonor, seed }) {
               <button className="fec-btn" onClick={show} disabled={loading || (!hasFed && !hasState) || (hasFed && !hasState && !cycles.length)}>
                 {loading ? "Gathering donors…" : "Open candidate page"}</button>
               {found.notes.length > 0 && <span className="tx-note warn" style={{ margin: 0 }}>{found.notes.join(" ")}</span>}
+              {localAcct.length > 0 && <span className="sub">County or city accounts under this name: {localAcct.map((f) => <button key={f.id} className="fec-chip" style={{ marginLeft: 6 }} onClick={() => onOpenLocal?.(f.id)}>{f.name} · {f.office || "local office"} · {f.county}</button>)}</span>}
             </div>
           </div>
         )}
@@ -1344,7 +1350,8 @@ function CandidateDonors({ onOpenDonor, seed }) {
 // =============================================================================================
 //  By place — who gives from a ZIP, county or city, and to whom
 // =============================================================================================
-function ByPlace({ meta, onOpenDonor }) {
+function ByPlace({ meta, onOpenDonor, onOpenLocal }) {
+  const [loc, setLoc] = useState(null);
   const [mode, setMode] = useState("zip");
   const [zip, setZip] = useState(""); const [county, setCounty] = useState(""); const [city, setCity] = useState("");
   const [d, setD] = useState(null); const [err, setErr] = useState(null); const [loading, setLoading] = useState(false);
@@ -1352,7 +1359,8 @@ function ByPlace({ meta, onOpenDonor }) {
   const run = async () => {
     const qs = mode === "zip" ? { zip } : mode === "county" ? { county } : { city };
     if (!Object.values(qs)[0]) return;
-    setLoading(true); setErr(null);
+    setLoading(true); setErr(null); setLoc(null);
+    if (mode !== "county") getJSON(`/api/tn/local/place?${qsOf(qs)}`).then(setLoc).catch(() => setLoc(null));
     try { setD(await getJSON(`/api/tn/place?${qsOf(qs)}`)); } catch (e) { setErr(e.message); setD(null); } finally { setLoading(false); }
   };
   const src = (s) => (s === "tn" ? "state" : "federal");
@@ -1388,6 +1396,15 @@ function ByPlace({ meta, onOpenDonor }) {
               <Rank title="Who receives" items={d.recipients.slice(0, 40).map((x) => ({ name: `${x.name || x.recipientId} · ${src(x.source)}`, total: x.total, count: x.donors }))} color="var(--olive)" />
             </div>
           )}
+          {loc && loc.total > 0 && (
+            <div className="tx-panel" style={{ padding: 0, overflow: "hidden" }}>
+              <h3 className="tx-h" style={{ padding: "12px 16px 0" }}>To county and city campaigns <span className="sub" style={{ fontFamily: "var(--font-ui)", fontWeight: 400 }}>· {fmtNum(loc.total)} gifts, {fmtUSD(loc.amount)}</span></h3>
+              <div className="fec-table-wrap" style={{ maxHeight: 360, overflowY: "auto" }}>
+                <table className="fec-table"><tbody>{loc.rows.map((r, i) => <tr key={i}><td>{r.name}</td><td>{r.filerId ? <button className="tx-linkbtn" onClick={() => onOpenLocal?.(r.filerId)}>{r.recipient}</button> : r.recipient}<div className="sub">{r.office} · {r.county} County</div></td><td className="sub">{r.n}× · {r.last}</td><td style={{ textAlign: "right", fontFamily: "var(--font-num)" }}>{fmtUSD(r.total)}</td></tr>)}</tbody></table>
+              </div>
+              <div className="tx-note" style={{ padding: "0 16px 12px" }}>Only local gifts whose address has been read from the filed report can be placed, so this list grows as reports are read (Local → Counties and reader).</div>
+            </div>
+          )}
           <div className="tx-note">{d.note}</div>
         </>
       )}
@@ -1407,6 +1424,7 @@ function OutsideSpending() {
   return (
     <>
       <p className="tx-lede">Independent expenditures reported to the state: money spent <b>for or against</b> a Tennessee candidate by PACs and others, outside the candidate’s own campaign.</p>
+      <NonprofitLookup />
       <div className="fec-status">
         <select className="fec-modelsel" value={year} onChange={(e) => setYear(e.target.value)} aria-label="Report year" style={{ fontSize: 14, padding: "6px 8px" }}>
           {Array.from({ length: 10 }, (_, i) => String(nowY - i)).map((y) => <option key={y} value={y}>Report year {y}</option>)}
@@ -1575,7 +1593,7 @@ function Lobbying() {
 // =============================================================================================
 //  Legislature — members, committees, sponsored bills
 // =============================================================================================
-function LegislatorCard({ chamber, district, onCandidate, compact }) {
+function LegislatorCard({ chamber, district, onCandidate, compact, onBill }) {
   const [m, setM] = useState(null); const [err, setErr] = useState(null); const [showBills, setShowBills] = useState(false);
   useEffect(() => { let live = true; setM(null); setErr(null); getJSON(`/api/tn/legislature/member?${qsOf({ chamber, district })}`).then((x) => live && setM(x)).catch((e) => live && setErr(e.message)); return () => { live = false; }; }, [chamber, district]);
   if (err) return compact ? null : <div className="fec-error">{err}</div>;
@@ -1604,7 +1622,7 @@ function LegislatorCard({ chamber, district, onCandidate, compact }) {
       {showBills && (
         <div className="fec-table-wrap" style={{ marginTop: 6, maxHeight: 360, overflowY: "auto" }}>
           <table className="fec-table"><tbody>
-            {m.bills.map((b) => <tr key={b.number}><td style={{ whiteSpace: "nowrap" }}>{b.url ? <a className="fec-extlink" href={b.url} target="_blank" rel="noopener noreferrer">{b.number}</a> : b.number}</td><td>{b.abstract}</td><td className="sub">{b.lastAction}<div>{b.date}</div></td></tr>)}
+            {m.bills.map((b) => <tr key={b.number}><td style={{ whiteSpace: "nowrap" }}>{b.url ? <a className="fec-extlink" href={b.url} target="_blank" rel="noopener noreferrer">{b.number}</a> : b.number}{onBill && <div><button className="tx-linkbtn" onClick={() => onBill(b.number, b.ga || m.billsGa)}>votes</button></div>}</td><td>{b.abstract}</td><td className="sub">{b.lastAction}<div>{b.date}</div></td></tr>)}
           </tbody></table>
         </div>
       )}
@@ -1614,12 +1632,12 @@ function LegislatorCard({ chamber, district, onCandidate, compact }) {
 
 function Legislature({ onCandidate }) {
   const [d, setD] = useState(null); const [err, setErr] = useState(null);
-  const [f, setF] = useState(""); const [chamber, setChamber] = useState(""); const [pick, setPick] = useState(null);
+  const [f, setF] = useState(""); const [chamber, setChamber] = useState(""); const [pick, setPick] = useState(null); const [bill, setBill] = useState(null);
   useEffect(() => { getJSON("/api/tn/legislature").then(setD).catch((e) => setErr(e.message)); }, []);
   const rows = (d?.members || []).filter((m) => (!chamber || m.chamber === chamber) && (!f || `${m.name} ${m.district}`.toUpperCase().includes(f.toUpperCase())));
   return (
     <>
-      <p className="tx-lede">The sitting General Assembly. Pick a member to see their <b>committee seats and sponsored bills</b>, then jump to who funds them.</p>
+      <p className="tx-lede">The sitting General Assembly. Pick a member to see their <b>committee seats and sponsored bills</b>, look up <b>how each member voted</b> on a bill, then jump to who funds them.</p>
       <div className="tx-panel">
         <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
           <input value={f} onChange={(e) => setF(e.target.value)} placeholder="Name or district" aria-label="Filter members"
@@ -1633,7 +1651,9 @@ function Legislature({ onCandidate }) {
       </div>
       {err && <div className="fec-error" role="alert">{err}</div>}
       {!d && !err && <div className="fec-empty"><span className="fec-spin">Reading the member directory</span></div>}
-      {pick && <LegislatorCard key={`${pick.chamber}${pick.district}`} chamber={pick.chamber} district={pick.district} onCandidate={onCandidate} />}
+      <BillVotes seed={bill} />
+      <Interests seed={pick ? { last: String(pick.name || "").split(",")[0].trim(), t: `${pick.chamber}${pick.district}` } : null} />
+      {pick && <LegislatorCard key={`${pick.chamber}${pick.district}`} chamber={pick.chamber} district={pick.district} onCandidate={onCandidate} onBill={(number, ga) => { setBill({ number, ga, t: Date.now() }); window.scrollTo({ top: 0, behavior: "smooth" }); }} />}
       {d && (
         <div className="tx-panel" style={{ padding: 0, overflow: "hidden" }}>
           <div className="fec-table-wrap">
@@ -1663,6 +1683,7 @@ function Legislature({ onCandidate }) {
 export default function TennesseeHub({ registry, seed, onOpenEntity, onOpenRace, onOpenDonor }) {
   const [section, setSection] = useState("candidate");
   const [candSeed, setCandSeed] = useState(null); // { name, t } — another section asking for a candidate page
+  const [localSeed, setLocalSeed] = useState(null); // { filerId, t }
   const [visited, setVisited] = useState({ registry: true, candidate: true });
   const meta = useMeta();
   const go = (s) => { setSection(s); setVisited((v) => (v[s] ? v : { ...v, [s]: true })); };
@@ -1670,6 +1691,8 @@ export default function TennesseeHub({ registry, seed, onOpenEntity, onOpenRace,
   useEffect(() => { if (seed?.t) go("registry"); /* eslint-disable-next-line */ }, [seed?.t]);
   const open = (name) => { const n = String(name || "").trim(); if (n) onOpenEntity(n); };
   const show = (s) => ({ display: section === s ? undefined : "none" });
+  const openLocal = (filerId) => { setLocalSeed({ filerId, t: Date.now() }); go("local"); window.scrollTo({ top: 0, behavior: "smooth" }); };
+  const openCandidate = (name) => { setCandSeed({ name, t: Date.now() }); go("candidate"); };
   return (
     <>
       <div className="tx-subnav" role="tablist" aria-label="Tennessee sections">
@@ -1678,14 +1701,16 @@ export default function TennesseeHub({ registry, seed, onOpenEntity, onOpenRace,
         ))}
       </div>
       {/* sections stay mounted once opened so a search isn't lost when you look at another one */}
-      <div style={show("candidate")}><CandidateDonors onOpenDonor={onOpenDonor} seed={candSeed} /></div>
+      <div style={show("candidate")}><CandidateDonors onOpenDonor={onOpenDonor} seed={candSeed} onOpenLocal={openLocal} /></div>
       <div style={show("registry")}>{registry}</div>
       {visited.directory && <div style={show("directory")}><Directory meta={meta} onOpenEntity={open} /></div>}
       {visited.money && <div style={show("money")}><MoneySearch meta={meta} onOpenEntity={open} /></div>}
       {visited.filings && <div style={show("filings")}><Filings meta={meta} onOpenEntity={open} /></div>}
-      {visited.local && <div style={show("local")}><Local /></div>}
+      {visited.local && <div style={show("local")}><Local seed={localSeed} /></div>}
+      {visited.state && <div style={show("state")}><StateDollars onOpenLocal={openLocal} /></div>}
+      {visited.results && <div style={show("results")}><Results onCandidate={openCandidate} /></div>}
       {visited.outside && <div style={show("outside")}><OutsideSpending /></div>}
-      {visited.place && <div style={show("place")}><ByPlace meta={meta} onOpenDonor={onOpenDonor} /></div>}
+      {visited.place && <div style={show("place")}><ByPlace meta={meta} onOpenDonor={onOpenDonor} onOpenLocal={openLocal} /></div>}
       {visited.lobby && <div style={show("lobby")}><Lobbying /></div>}
       {visited.leg && <div style={show("leg")}><Legislature onCandidate={(name) => { setCandSeed({ name, t: Date.now() }); go("candidate"); }} /></div>}
       {visited.races && <div style={show("races")}><FederalRaces onOpenRace={onOpenRace} /></div>}

@@ -6598,7 +6598,19 @@ function AlertsPanel({ onClose, onCount }) {
       <div style={{ padding: "8px 16px 14px" }}>
         {!st && <div className="fec-spin">Loading…</div>}
         {st && !(st.feed || []).length && <div className="fec-empty" style={{ marginTop: 8 }}>No alerts yet — track candidates/donors, save a search, then hit ↺ Scan now.</div>}
-        {(st?.feed || []).map((a) => (
+        {/* daily digest: alerts grouped under the day they arrived, with a one-line count and a copy button */}
+        {(st?.feed || []).flatMap((a, i, all) => {
+          const dayOf = (x) => new Date(x.at).toLocaleDateString(undefined, { weekday: "long", month: "short", day: "numeric" });
+          const head = i === 0 || dayOf(all[i - 1]) !== dayOf(a);
+          const same = head ? all.filter((x) => dayOf(x) === dayOf(a)) : [];
+          const kinds = head ? Object.entries(same.reduce((m, x) => ({ ...m, [x.kind]: (m[x.kind] || 0) + 1 }), {})).map(([k, n]) => `${n} ${({ filing: "filing", ie: "outside spending", pac: "PAC", search: "saved search", tn: "Tennessee", local: "local" })[k] || k}`).join(" · ") : "";
+          return [head && (
+            <div key={`day-${a.id || a.ref}`} style={{ display: "flex", gap: 10, alignItems: "baseline", padding: "10px 0 2px" }}>
+              <b style={{ fontSize: 13 }}>{dayOf(a)}</b><span className="sub">{kinds}</span>
+              <button className="fec-btn ghost sm" style={{ marginLeft: "auto" }} title="Copy this day’s alerts as plain text"
+                onClick={() => navigator.clipboard?.writeText(`${dayOf(a)}\n` + same.map((x) => `- ${x.subject}: ${x.detail || ""}`).join("\n"))}>Copy digest</button>
+            </div>
+          ), (
           <div key={a.id || a.ref} style={{ display: "flex", gap: 10, padding: "6px 0", borderBottom: "1px solid var(--line)", fontSize: 12, alignItems: "baseline" }}>
             <span title={a.kind}>{ALERT_ICON[a.kind] || "•"}</span>
             <b style={{ color: "var(--bone)", whiteSpace: "nowrap" }}>{a.subject}</b>
@@ -6606,7 +6618,8 @@ function AlertsPanel({ onClose, onCount }) {
               style={a.kind === "ie" && /AGAINST/.test(a.detail || "") ? { color: "var(--rose)" } : {}}>{a.detail}</span>
             <span className="sub" style={{ marginLeft: "auto", whiteSpace: "nowrap" }}>{timeAgo(a.at)}</span>
           </div>
-        ))}
+          )];
+        })}
       </div>
     </div>
   );

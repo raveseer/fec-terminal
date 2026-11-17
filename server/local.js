@@ -14,6 +14,8 @@
 // Verified against the live portal, Nov 2026.
 
 import fs from "node:fs";
+import crypto from "node:crypto";
+import express from "express";
 import path from "node:path";
 import { rawDb, settingGet, settingSet, alertAdd } from "./db.js";
 import { TN_COUNTIES } from "./tnx.js";
@@ -23,6 +25,8 @@ const API = "https://ecf-api.easyvoteapp.com";
 const UA = "fec-terminal/4.2 (personal campaign-finance research)";
 const DATA_DIR = process.env.DATA_DIR || path.join(process.cwd(), "data");
 const PDF_DIR = path.join(DATA_DIR, "local-pdf");
+const UPLOAD_DIR = path.join(DATA_DIR, "local-upload"); // reports a person supplied; never pruned
+const UPLOADS = "uploads";
 const PDF_CACHE_MAX = Number(process.env.LOCAL_PDF_CACHE_MB || 1500) * 1024 * 1024;
 const DAY = 86_400_000;
 
@@ -106,6 +110,7 @@ export function registerLocal(app) {
   `);
   const seed = db.prepare("INSERT OR IGNORE INTO local_source (sub, customer_id, county) VALUES (?, ?, ?)");
   for (const [sub, cid, county] of KNOWN_SOURCES) seed.run(sub, cid, county);
+  seed.run(UPLOADS, "", "Uploaded");
   try { db.exec("ALTER TABLE local_doc ADD COLUMN needs_review INTEGER DEFAULT 0"); } catch { /* already there */ }
   // a crash mid-read leaves rows marked as in progress
   db.exec("UPDATE local_doc SET extract_status = 'none' WHERE extract_status IN ('queued','reading')");
@@ -188,7 +193,7 @@ export function registerLocal(app) {
   }
   async function sync({ subs = null } = {}) {
     if (state.running) return { error: "Already running." };
-    const list = sources().filter((s) => !subs || subs.includes(s.sub));
+    const list = sources().filter((s) => s.customer_id && (!subs || subs.includes(s.sub)));
     Object.assign(state, { running: true, at: Date.now(), done: 0, total: list.length, current: null, errors: [], newDocs: [] });
     try {
       for (const src of list) {
@@ -227,6 +232,11 @@ export function registerLocal(app) {
   //  PDF cache
   // =====================================================================================
   async function pdfPath(doc) {
+    if (doc.sub === UPLOADS) {
+      const up0 = path.join(UPLOAD_DIR, `${doc.doc_id}.pdf`);
+      if (!fs.existsSync(up0)) throw new Error("The uploaded file is no longer on disk.");
+      return up0;
+    }
     fs.mkdirSync(PDF_DIR, { recursive: true });
     const file = path.join(PDF_DIR, `${doc.doc_id}.pdf`);
     if (fs.existsSync(file) && fs.statSync(file).size > 500) { const t = new Date(); try { fs.utimesSync(file, t, t); } catch { /* read-only */ } return file; }
@@ -348,7 +358,7 @@ export function registerLocal(app) {
     res.json({
       sources: sources().map((s) => ({ sub: s.sub, county: s.county, syncedAt: s.synced_at, error: s.error, filers: s.filers, docs: s.docs, contribs: s.contribs, dists: s.dists,
         reports: read[s.sub]?.reports || 0, paper: read[s.sub]?.paper || 0, read: read[s.sub]?.done || 0, failed: read[s.sub]?.failed || 0, pending: pending[s.sub] || 0, reviewDocs: pendingDocs[s.sub] || 0,
-        url: `https://${s.sub}.easyvotecampaignfinance.com/home/publicfilings` })),
+        url: s.customer_id ? `https://${s.sub}.easyvotecampaignfinance.com/home/publicfilings` : null, uploads: !s.customer_id })),
       sync: { running: state.running, done: state.done, total: state.total, current: state.current, errors: state.errors.slice(0, 5), at: Number(settingGet("localSyncAt") || 0) || null },
       reader: { ...reader, tools: toolsAvailable(), models: models() },
       home: homeSubs(),
@@ -410,7 +420,7 @@ export function registerLocal(app) {
     const reports = docs.filter((d) => d.kind === "cfd" || d.kind === "interim");
     res.json({
       filer: { id: f.filer_id, sub: f.sub, county: f.county, name: f.display, first: f.first, last: f.last, office: f.office, type: f.filer_type, status: f.status,
-        url: `https://${f.sub}.easyvotecampaignfinance.com/home/publicfilings` },
+        url: f.sub === UPLOADS ? null : `https://${f.sub}.easyvotecampaignfinance.com/home/publicfilings` },
       totals: { raised: sums.raised || 0, spent: sums.spent || 0, loans: sums.loans || 0, pending: sums.pending || 0, pendingAmt: sums.pendingAmt || 0 },
       coverage: { reports: reports.length, structured: reports.filter((d) => d.efiled).length, read: reports.filter((d) => d.status === "done").length,
         unread: reports.filter((d) => !d.efiled && d.status !== "done").length },
@@ -427,15 +437,15 @@ export function registerLocal(app) {
     if (sub) { where.push("i.sub = ?"); args.push(sub); }
     if (kind === "out") where.push("i.kind = 'expenditure'"); else where.push("i.kind != 'expenditure'");
     const w = where.join(" AND ");
-    const rows = db.prepare(`SELECT i.id, i.name, i.kind, i.date, i.amount, i.source, i.city, i.state, i.employer, i.recipient, i.office, i.filer_id filerId, i.doc_id docId, s.county
-      FROM local_item i JOIN local_source s ON s.sub = i.sub WHERE ${w} ORDER BY i.amount DESC LIMIT 500`).all(...args);
+    const rows = db.prepare(`SELECT i.id, i.name, i.kind, i.date, i.amount, i.source, i.city, i.state, i.employer, i.recipient, i.office, i.filer_id filerId, i.doc_id docId, COALESCE(f.county, s.county) county
+      FROM local_item i JOIN local_source s ON s.sub = i.sub LEFT JOIN local_filer f ON f.filer_id = i.filer_id WHERE ${w} ORDER BY i.amount DESC LIMIT 500`).all(...args);
     const agg = db.prepare(`SELECT COUNT(*) n, COALESCE(SUM(amount), 0) total FROM local_item i WHERE ${w}`).get(...args);
     res.json({ rows, total: agg.n, amount: agg.total });
   });
 
   // ---- one document: its rows, flags and page images ----
   const docOut = (id) => {
-    const d = db.prepare("SELECT d.*, f.display filer, f.office, s.county FROM local_doc d LEFT JOIN local_filer f ON f.filer_id = d.filer_id JOIN local_source s ON s.sub = d.sub WHERE d.doc_id = ?").get(id);
+    const d = db.prepare("SELECT d.*, f.display filer, f.office, COALESCE(f.county, s.county) county FROM local_doc d LEFT JOIN local_filer f ON f.filer_id = d.filer_id JOIN local_source s ON s.sub = d.sub WHERE d.doc_id = ?").get(id);
     if (!d) return null;
     const items = db.prepare("SELECT * FROM local_item WHERE doc_id = ? ORDER BY CASE kind WHEN 'expenditure' THEN 2 WHEN 'loan' THEN 1 ELSE 0 END, page, id").all(id)
       .map((i) => ({ ...i, flags: i.flags ? JSON.parse(i.flags) : [], original: i.original ? JSON.parse(i.original) : null }));
@@ -494,7 +504,7 @@ export function registerLocal(app) {
   app.get("/api/tn/local/review", (req, res) => {
     const sub = qstr(req.query.sub);
     const args = sub ? [sub] : [];
-    const docs = db.prepare(`SELECT d.doc_id id, d.name, d.submitted, d.extract_method method, d.flags, d.totals, d.pages, f.display filer, f.office, s.county, d.filer_id filerId,
+    const docs = db.prepare(`SELECT d.doc_id id, d.name, d.submitted, d.extract_method method, d.flags, d.totals, d.pages, f.display filer, f.office, COALESCE(f.county, s.county) county, d.filer_id filerId,
         (SELECT COUNT(*) FROM local_item i WHERE i.doc_id = d.doc_id AND i.review = 'pending') pending,
         (SELECT COALESCE(SUM(amount), 0) FROM local_item i WHERE i.doc_id = d.doc_id AND i.review = 'pending') amount
       FROM local_doc d LEFT JOIN local_filer f ON f.filer_id = d.filer_id JOIN local_source s ON s.sub = d.sub
@@ -565,6 +575,53 @@ export function registerLocal(app) {
     const r = db.prepare(`INSERT INTO local_item (doc_id, sub, filer_id, kind, name, norm, recipient, office, date, amount, source, page, confidence, flags, review, reviewed_at)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'manual', ?, 1, '["entered_by_hand"]', 'edited', ?)`).run(d.doc_id, d.sub, d.filer_id, kind, name, normName(name), filer?.display || null, filer?.office || null, f.date || null, amount, Number(f.page) || null, Date.now());
     res.json({ ok: true, id: Number(r.lastInsertRowid) });
+  });
+
+  // ---- a report from a county that is not online: upload the PDF, read it like any other ----
+  app.post("/api/tn/local/upload", express.raw({ type: ["application/pdf", "application/octet-stream"], limit: "40mb" }), (req, res) => {
+    const buf = req.body;
+    if (!Buffer.isBuffer(buf) || buf.length < 500 || buf.subarray(0, 4).toString("latin1") !== "%PDF") return fail(res, 400, "Send one PDF file.");
+    const clean = (v, max = 120) => qstr(v).replace(/\s+/g, " ").trim().slice(0, max);
+    const county = clean(req.query.county, 40).replace(/ county$/i, ""), filer = clean(req.query.filer), office = clean(req.query.office), name = clean(req.query.name) || "Uploaded report";
+    const filed = /^\d{4}-\d{2}-\d{2}$/.test(qstr(req.query.filed)) ? req.query.filed : null;
+    if (!county || !filer) return fail(res, 400, "Give the county and the candidate or committee name.");
+    const now = Date.now();
+    const filerId = `U-${crypto.createHash("sha1").update(`${county}|${filer}|${office}`.toUpperCase()).digest("hex").slice(0, 16).toUpperCase()}`;
+    const docId = `U-${crypto.createHash("sha1").update(buf).digest("hex").slice(0, 24).toUpperCase()}`;
+    if (db.prepare("SELECT 1 FROM local_doc WHERE doc_id = ?").get(docId)) return res.json({ ok: true, docId, filerId, duplicate: true });
+    fs.mkdirSync(UPLOAD_DIR, { recursive: true });
+    fs.writeFileSync(path.join(UPLOAD_DIR, `${docId}.pdf`), buf);
+    const parts = filer.includes(",") ? filer.split(",").map((x) => x.trim()) : null;
+    db.prepare(`INSERT INTO local_filer (filer_id, sub, county, first, middle, last, committee, display, office, filer_type, status, norm, first_seen, fetched_at) VALUES (?, ?, ?, ?, NULL, ?, NULL, ?, ?, 'Candidate', 'Uploaded', ?, ?, ?)
+      ON CONFLICT(filer_id) DO UPDATE SET fetched_at = excluded.fetched_at`).run(filerId, UPLOADS, county, parts?.[1] || null, parts?.[0] || null, filer, office || null, normName(filer), now, now);
+    db.prepare("INSERT INTO local_doc (doc_id, filer_id, sub, name, doc_type, kind, submitted, efiled, first_seen) VALUES (?, ?, ?, ?, 'Uploaded PDF', 'cfd', ?, 0, ?)").run(docId, filerId, UPLOADS, name, filed, now);
+    db.prepare("UPDATE local_source SET filers = (SELECT COUNT(*) FROM local_filer WHERE sub = ?), docs = (SELECT COUNT(*) FROM local_doc WHERE sub = ?), synced_at = ? WHERE sub = ?").run(UPLOADS, UPLOADS, now, UPLOADS);
+    const queued = !reader.running;
+    if (queued) runReader({ docIds: [docId] }).catch((e) => console.warn("[local read]", e.message));
+    res.json({ ok: true, docId, filerId, reading: queued });
+  });
+
+  // ---- links from the rest of the app ----
+  // a person by name: do they also hold a county or city campaign account?
+  app.get("/api/tn/local/match", (req, res) => {
+    const toks = normName(qstr(req.query.name)).split(" ").filter((t) => t.length > 1);
+    if (toks.length < 2) return res.json({ filers: [] });
+    const last = toks[toks.length - 1], first = toks[0];
+    const rows = db.prepare(`SELECT f.filer_id id, f.display name, f.office, f.county, f.status,
+        (SELECT COALESCE(SUM(amount), 0) FROM local_item i WHERE i.filer_id = f.filer_id AND i.kind IN ('contribution','inkind') AND i.review IN ${COUNTED}) raised
+      FROM local_filer f WHERE (UPPER(f.last) = ? AND UPPER(f.first) LIKE ?) OR (UPPER(f.last) = ? AND UPPER(f.first) LIKE ?) ORDER BY raised DESC LIMIT 12`).all(last, `${first.slice(0, 3)}%`, first, `${last.slice(0, 3)}%`);
+    res.json({ filers: rows });
+  });
+  // giving to county and city campaigns from one place (rows whose address was read from the report)
+  app.get("/api/tn/local/place", (req, res) => {
+    const zip = qstr(req.query.zip).replace(/\D/g, "").slice(0, 5), city = qstr(req.query.city).trim().toUpperCase();
+    if (zip.length !== 5 && city.length < 2) return res.json({ rows: [], total: 0, amount: 0 });
+    const cond = zip.length === 5 ? "i.zip = ?" : "UPPER(i.city) = ?", arg = zip.length === 5 ? zip : city;
+    const rows = db.prepare(`SELECT MAX(i.name) name, i.recipient, i.office, COALESCE(f.county, s.county) county, i.filer_id filerId, COUNT(*) n, SUM(i.amount) total, MAX(i.date) last
+      FROM local_item i JOIN local_source s ON s.sub = i.sub LEFT JOIN local_filer f ON f.filer_id = i.filer_id
+      WHERE ${cond} AND i.kind IN ('contribution','inkind') AND i.review IN ${COUNTED} GROUP BY i.norm, i.filer_id ORDER BY total DESC LIMIT 200`).all(arg);
+    const t = db.prepare(`SELECT COUNT(*) n, COALESCE(SUM(amount), 0) amount FROM local_item i WHERE ${cond} AND i.kind IN ('contribution','inkind') AND i.review IN ${COUNTED}`).get(arg);
+    res.json({ rows, total: t.n, amount: t.amount });
   });
 
   // weekly re-sync so the section is never stale when opened

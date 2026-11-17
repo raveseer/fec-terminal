@@ -11,6 +11,7 @@ import { registerTnExplorer } from "./tnx.js";
 import { registerCandidate } from "./candidate.js";
 import { registerStatehouse } from "./statehouse.js";
 import { registerLocal } from "./local.js";
+import { registerTnState } from "./tnstate.js";
 import { cacheGet, cacheSet, cacheGetWithAge, cacheGetStale, cacheCount, cacheFlush, settingGet, settingSet, persistent,
          dbStorageStats, dbCompact, tnEntityUpsertMany, tnEntityNewSince,
          tnReportListGet, tnReportListSave, tnReportDetailGet, tnReportDetailSave, tnReportCount,
@@ -4569,6 +4570,7 @@ Write a 150-220 word analysis of where the money comes from and where it goes: n
 const tnx = registerTnExplorer(app, { fecFetch, moneySearchAll, wantsRefresh, TTL });
 const statehouse = registerStatehouse(app, { normalizeEmployerName });
 const local = registerLocal(app);
+registerTnState(app, { normalizeEmployerName, lobbyIndex: statehouse.lobbyIndex, fecFetch, wantsRefresh });
 registerCandidate(app, { fecFetch, moneySearchAll, wantsRefresh, TTL, normalizeDonorKey, normDate, ingestScheduleA,
   tnLedgerData, parseTnContributor, normalizeEmployerName, lobbyIndex: statehouse.lobbyIndex });
 
