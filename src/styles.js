@@ -331,6 +331,8 @@ export const css = `
     .fec-status { flex-direction:column; align-items:flex-start; gap:8px; }
     .tx-form .wide, .tx-form > .fec-field { grid-column:1 / -1 !important; }
     .tx-cols { grid-template-columns:1fr !important; }
+    .lc-split { grid-template-columns:1fr !important; }
+    .lc-split > div { position:static !important; }
   }
 
   .fec-controls-row { display:flex; flex-wrap:wrap; gap:8px; align-items:center; }

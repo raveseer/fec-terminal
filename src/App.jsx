@@ -6560,7 +6560,7 @@ Matches any part of the name. For a <b>candidate</b>, use the <b>last name</b> (
 
 // ---------- admin panel ----------
 // ---- alerts panel (filings · attack ads · PAC spreading · standing searches) ----
-const ALERT_ICON = { filing: "📄", ie: "📣", pac: "🕸", search: "⌕", tn: "🏛" };
+const ALERT_ICON = { filing: "📄", ie: "📣", pac: "🕸", search: "⌕", tn: "🏛", local: "🏘" };
 function AlertsPanel({ onClose, onCount }) {
   const [st, setSt] = useState(null);
   const [scanning, setScanning] = useState(false);

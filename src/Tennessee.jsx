@@ -7,6 +7,7 @@
 //   Federal dollars  USAspending.gov — contracts, grants, loans and payments landing in Tennessee
 import { useEffect, useMemo, useRef, useState } from "react";
 import { fmtUSD, fmtUSDshort, fmtNum, timeAgo, partyColor, downloadCSV, getJSON } from "./lib.js";
+import Local from "./Local.jsx";
 
 const SECTIONS = [
   ["candidate", "Candidate"],
@@ -14,6 +15,7 @@ const SECTIONS = [
   ["directory", "Directory"],
   ["money", "Money search"],
   ["filings", "Filings"],
+  ["local", "Local"],
   ["outside", "Outside spending"],
   ["place", "By place"],
   ["lobby", "Lobbying"],
@@ -1681,6 +1683,7 @@ export default function TennesseeHub({ registry, seed, onOpenEntity, onOpenRace,
       {visited.directory && <div style={show("directory")}><Directory meta={meta} onOpenEntity={open} /></div>}
       {visited.money && <div style={show("money")}><MoneySearch meta={meta} onOpenEntity={open} /></div>}
       {visited.filings && <div style={show("filings")}><Filings meta={meta} onOpenEntity={open} /></div>}
+      {visited.local && <div style={show("local")}><Local /></div>}
       {visited.outside && <div style={show("outside")}><OutsideSpending /></div>}
       {visited.place && <div style={show("place")}><ByPlace meta={meta} onOpenDonor={onOpenDonor} /></div>}
       {visited.lobby && <div style={show("lobby")}><Lobbying /></div>}

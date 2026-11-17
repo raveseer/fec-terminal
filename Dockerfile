@@ -10,6 +10,9 @@ RUN npm run build
 FROM node:22-alpine
 WORKDIR /app
 ENV NODE_ENV=production
+# reading local filings: poppler renders/extracts PDF pages, tesseract is the second reader for scans
+# (fonts: without them poppler draws a form's filled-in values but not its printed labels)
+RUN apk add --no-cache poppler-utils tesseract-ocr tesseract-ocr-data-eng fontconfig ttf-liberation
 # --chown so the unprivileged `node` user can read files regardless of
 # host file permissions in the build context (COPY preserves mode bits)
 COPY --chown=node:node package*.json ./

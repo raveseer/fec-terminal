@@ -1,4 +1,4 @@
-# FEC Records Terminal v4.2
+# FEC Records Terminal v4.3
 
 Self-hosted explorer for the OpenFEC API with local-AI donor analysis and Tennessee
 state-records search.
@@ -27,7 +27,7 @@ state-records search.
   are cached + force-refreshable. Needs a tool-capable model (`OLLAMA_TOOL_MODEL`, default
   `mistral-small3.2:latest`, selectable in Admin); web search is optional (`SEARCH_API_KEY`) and
   degrades to FEC/TN/Wikipedia/news when unset.
-- **Tennessee tab** — eleven ways into Tennessee money, all sharing one cache:
+- **Tennessee tab** — twelve ways into Tennessee money, all sharing one cache:
   - *Candidate* — type a name, pick the matching federal committees (principal, joint
     fundraising, leadership PAC) and state account, and open one page: merged donor list
     (federal $ / state $ / total, identities merged, CSV), where the money comes from (state,
@@ -35,6 +35,10 @@ state-records search.
     the state lobbying roster, spending and outside money, and — for sitting legislators —
     committee seats and sponsored bills. State rows come from the account's filed reports
     (TREF's own contribution search stops at 500 rows).
+  - *Local* — county and city offices. Fourteen county election commissions publish their
+    filings through one vendor portal; this section indexes every filer and document there,
+    loads the itemized rows of reports filed online, reads PDF-only reports by machine, and
+    holds anything uncertain in a review queue. See "Local filings" below.
   - *Outside spending* — state independent expenditures by candidate, for and against.
   - *By place* — pick a ZIP, county or city: who there gives, and to whom (state + federal).
   - *Lobbying* — the Ethics Commission roster: employers of lobbyists, lobbyists, who lobbies
@@ -66,6 +70,40 @@ in or linked to Tennessee, and gifts from Tennessee residents to anyone. A cycle
 minutes and adds roughly a million rows. The file contains donors whose giving passed $200; the
 smaller earmarked gifts some committees also itemize are only available through the API pull on
 the Candidate page. CLI: `node scripts/import-fec-bulk.js --cycles 2026,2024 --indiv`.
+
+## Local filings (county and city offices)
+
+Local candidates file with their county election commission, not the state, and there is no
+statewide feed. Fourteen counties (Washington, Sullivan, Greene, Hamblen, Knox, Anderson,
+Hamilton, Davidson, Williamson, Rutherford, Maury, Madison, Marion, Shelby) publish through
+EasyVote's "Easy Campaign Finance" portal, which answers three public requests per county: every
+filer with their documents, itemized contributions, and itemized expenditures. The other 81
+counties keep paper at the commission office and are not covered.
+
+Three kinds of data, labelled on every row:
+
+| Label | Where it comes from | Trust |
+|---|---|---|
+| filed online | the county's own structured data | counted as is |
+| from PDF text | a PDF with a text layer, arranged into rows by a local model | counted only if every amount and name is found literally in the page text and the page total adds up |
+| OCR | a scanned, often handwritten, page | counted only if two independent readers agree and the form's running total adds up |
+
+Anything that fails a check is stored as *pending*, left out of every total and search, and listed
+under Local → Review, where each row sits beside the page it was read from. You can confirm it,
+correct it (the machine's original reading is kept), reject it, or add a row the reader missed.
+Report-level figures (receipts, disbursements, balance) are marked verified only when balance
+last report + receipts − disbursements = balance on hand.
+
+Reading needs Ollama on the host with a vision model. Defaults: `gemma4:31b` reads, `mistral-
+small3.2` reads again as the second opinion and arranges text pages; change them with
+`LOCAL_OCR_MODEL`, `LOCAL_OCR_VERIFY_MODEL`, `LOCAL_TEXT_MODEL`. A scanned page takes minutes,
+a text page seconds, so the reader runs as a background queue (Local → Counties and reader) and
+starts with your own counties. PDFs are cached under `data/local-pdf` (1.5 GB cap,
+`LOCAL_PDF_CACHE_MB`).
+
+Limits: the county search exposes names, dates and amounts only — addresses and employers arrive
+when the PDF is read. Handwriting is the weak point; expect most handwritten rows to land in
+Review. Unitemized small gifts are only in a report's receipts figure.
 
 ## Automatic Tennessee check
 
@@ -172,6 +210,10 @@ the initial default).
 - `/api/tn/candidate/find?q=`, `POST /api/tn/candidate/donors|geo|employers|spending`
   (`{committees, cycles, state: [{tnId, name}], candIds}`), `GET|POST /api/tn/candidate/pull`
 - `/api/tn/place?zip=|county=|city=`, `/api/tn/ie?year=`
+- `/api/tn/local/sources`, `POST /api/tn/local/sync|discover|home`, `/api/tn/local/filers?sub=&q=&office=`,
+  `/api/tn/local/filer/:id`, `/api/tn/local/search?q=&kind=out`, `/api/tn/local/doc/:id` (+ `/pdf`,
+  `/page/:n`, `POST /read|review|add`), `POST /api/tn/local/item/:id`, `/api/tn/local/review`,
+  `GET|POST /api/tn/local/reader[/start|/stop|/models]`
 - `/api/tn/lobby?q=`, `/api/tn/lobby/employer/:id`, `/api/tn/lobby/lobbyist/:id`
 - `/api/tn/legislature`, `/api/tn/legislature/member?chamber=H|S&district=`
 - `GET|POST /api/tn/auto`, `POST /api/tn/auto/run`

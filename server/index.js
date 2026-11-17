@@ -10,6 +10,7 @@ import { searchCandidatesPacs, listReports, fetchReportDetail, searchMoney, tnHe
 import { registerTnExplorer } from "./tnx.js";
 import { registerCandidate } from "./candidate.js";
 import { registerStatehouse } from "./statehouse.js";
+import { registerLocal } from "./local.js";
 import { cacheGet, cacheSet, cacheGetWithAge, cacheGetStale, cacheCount, cacheFlush, settingGet, settingSet, persistent,
          dbStorageStats, dbCompact, tnEntityUpsertMany, tnEntityNewSince,
          tnReportListGet, tnReportListSave, tnReportDetailGet, tnReportDetailSave, tnReportCount,
@@ -4567,6 +4568,7 @@ Write a 150-220 word analysis of where the money comes from and where it goes: n
 // ---- Tennessee explorer: directory, full C&E search, report search, federal dollars ----
 const tnx = registerTnExplorer(app, { fecFetch, moneySearchAll, wantsRefresh, TTL });
 const statehouse = registerStatehouse(app, { normalizeEmployerName });
+const local = registerLocal(app);
 registerCandidate(app, { fecFetch, moneySearchAll, wantsRefresh, TTL, normalizeDonorKey, normDate, ingestScheduleA,
   tnLedgerData, parseTnContributor, normalizeEmployerName, lobbyIndex: statehouse.lobbyIndex });
 
@@ -4621,6 +4623,9 @@ async function runTnAuto(trigger = "manual") {
         }
       }
     }
+    // county and city filings in the home counties (Tennessee → Local)
+    try { const lc = await local.checkHome(cfg.giftThreshold); alerts.push(...lc.alerts); notes.push(...lc.notes.map((n) => `local: ${n}`)); }
+    catch (e) { notes.push(`local: ${e.message}`); }
     const added = alertAdd(alerts);
     const last = { at: Date.now(), trigger, seconds: Math.round((Date.now() - startedAt) / 1000), added, tracked: checked, ok: true, notes: notes.slice(0, 6) };
     settingSet("tnAutoAt", String(startedAt));
