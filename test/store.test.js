@@ -74,3 +74,30 @@ test("TREF result row -> directory entity -> local search", () => {
   db.tnEntityUpsertMany([{ tnId: "8022", year: "2026", name: "ALEXANDER, REBECCA KEEFAUVER" }]);
   assert.equal(db.tnEntitySearch({ q: "alexander" }).rows[0].treasurer, "WADE FARMER");
 });
+
+const { parseDonorName, identityKeys, mergeDonorGroups } = await import("../server/identity.js");
+
+test("donor identity: titles ignored, suffixes and middle names respected", () => {
+  assert.deepEqual(parseDonorName("HASLAM, JAMES A. MR. III"), { person: true, last: "HASLAM", first: "JAMES", given: "JAMES A", suffix: "III" });
+  assert.equal(parseDonorName("TRACTOR SUPPLY COMPANY POLITICAL ACTION COMMITTEE").org, "TRACTOR SUPPLY");
+  const share = (a, b) => identityKeys(a).some((k) => identityKeys(b).includes(k));
+  assert.ok(share({ name: "HASLAM, JAMES A. III", state: "TN" }, { name: "HASLAM, JAMES A. MR. III", state: "TN" }), "courtesy title only");
+  assert.ok(!share({ name: "SMITH, JOHN", state: "TN" }, { name: "SMITH, JOHN A", state: "TN" }), "middle initial differs and no ZIP → not merged");
+  assert.ok(share({ name: "SMITH, JOHN", state: "TN", zip: "37660" }, { name: "SMITH, JOHN A", state: "TN", zip: "376601234" }), "same first name + same ZIP");
+  assert.ok(!share({ name: "SMITH, JOHN JR", state: "TN", zip: "37660" }, { name: "SMITH, JOHN SR", state: "TN", zip: "37660" }), "father and son stay separate");
+  assert.ok(!share({ name: "SMITH, JOHN", state: "TN", zip: "37660" }, { name: "SMITH, JOHN", state: "GA", zip: "30301" }), "same name, different place");
+});
+
+test("donor identity: groups merge transitively and keep the largest record's fields", () => {
+  const out = mergeDonorGroups([
+    { name: "SMITH, JOHN MR.", st: "TN", zip: "37660", total: 100, n: 1 },
+    { name: "SMITH, JOHN", st: "TN", zip: "", total: 500, n: 2 },
+    { name: "SMITH, JOHN A", st: "TN", zip: "37660", total: 50, n: 1 },
+    { name: "JONES, MARY", st: "TN", zip: "37660", total: 10, n: 1 },
+  ], { weight: (g) => g.total, combine: (a, b) => { a.total += b.total; a.n += b.n; } });
+  assert.equal(out.length, 2);
+  const smith = out.find((g) => g.name.startsWith("SMITH"));
+  assert.equal(smith.total, 650);
+  assert.equal(smith.variants, 3);
+  assert.equal(smith.name, "SMITH, JOHN", "largest member is the display record");
+});

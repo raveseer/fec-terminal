@@ -6560,7 +6560,7 @@ Matches any part of the name. For a <b>candidate</b>, use the <b>last name</b> (
 
 // ---------- admin panel ----------
 // ---- alerts panel (filings · attack ads · PAC spreading · standing searches) ----
-const ALERT_ICON = { filing: "📄", ie: "📣", pac: "🕸", search: "⌕" };
+const ALERT_ICON = { filing: "📄", ie: "📣", pac: "🕸", search: "⌕", tn: "🏛" };
 function AlertsPanel({ onClose, onCount }) {
   const [st, setSt] = useState(null);
   const [scanning, setScanning] = useState(false);
@@ -6789,6 +6789,7 @@ function BulkImportSection() {
   const [st, setSt] = useState(null); // GET /api/admin/bulk-import payload
   const [cyclesIn, setCyclesIn] = useState("");
   const [othIn, setOthIn] = useState(true);
+  const [indivIn, setIndivIn] = useState(false);
   const [schedOn, setSchedOn] = useState(false);
   const [schedHours, setSchedHours] = useState(168);
   const [msg, setMsg] = useState(null);
@@ -6806,6 +6807,7 @@ function BulkImportSection() {
           firstRef.current = false;
           setCyclesIn((d.schedule.cycles || []).join(","));
           setOthIn(d.schedule.oth !== false);
+          setIndivIn(!!d.schedule.indiv);
           setSchedOn(!!d.schedule.enabled);
           setSchedHours(d.schedule.everyHours || 168);
         }
@@ -6821,7 +6823,7 @@ function BulkImportSection() {
     try {
       const res = await fetch("/api/admin/bulk-import", {
         method: "POST", headers: { "content-type": "application/json" },
-        body: JSON.stringify({ cycles: cyclesIn, oth: othIn }),
+        body: JSON.stringify({ cycles: cyclesIn, oth: othIn, indiv: indivIn }),
       });
       const d = await res.json().catch(() => null);
       if (!res.ok) throw new Error(d?.error?.message || `HTTP ${res.status}`);
@@ -6835,7 +6837,7 @@ function BulkImportSection() {
     try {
       const res = await fetch("/api/admin/bulk-schedule", {
         method: "POST", headers: { "content-type": "application/json" },
-        body: JSON.stringify({ enabled, everyHours: schedHours, cycles: cyclesIn, oth: othIn }),
+        body: JSON.stringify({ enabled, everyHours: schedHours, cycles: cyclesIn, oth: othIn, indiv: indivIn }),
       });
       const d = await res.json().catch(() => null);
       if (!res.ok) throw new Error(d?.error?.message || `HTTP ${res.status}`);
@@ -6892,6 +6894,10 @@ function BulkImportSection() {
         <label className="fec-check">
           <input type="checkbox" checked={othIn} onChange={(e) => setOthIn(e.target.checked)} />
           PAC→PAC (oth)
+        </label>
+        <label className="fec-check" title="Every itemized individual gift to Tennessee committees and from Tennessee residents. Streams the nationwide file (1–2 GB per cycle) and keeps only Tennessee rows — expect several minutes per cycle.">
+          <input type="checkbox" checked={indivIn} onChange={(e) => setIndivIn(e.target.checked)} />
+          TN individual donors (indiv)
         </label>
         <button className="fec-btn ghost" style={{ fontSize: 11, padding: "3px 12px" }} onClick={runNow} disabled={st?.running}>
           {st?.running ? "⟳ Importing…" : "⬇ Load bulk data now"}

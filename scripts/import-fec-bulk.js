@@ -2,7 +2,13 @@
 // FEC bulk importer — the "PAC layer": nationwide committee/candidate masters plus every
 // committee→candidate contribution (pas2) and, with --oth, committee→committee transfers (oth).
 //
-//   node scripts/import-fec-bulk.js --cycles 2026,2024,2022 [--oth] [--fresh]
+//   node scripts/import-fec-bulk.js --cycles 2026,2024,2022 [--oth] [--indiv] [--fresh]
+//
+// --indiv adds the "people layer" for one state (default TN, --indiv-state XX): every itemized
+// individual contribution (a) received by a committee based in or linked to that state and
+// (b) given by a resident of that state to anyone. The nationwide indiv file is 40-70M rows per
+// cycle; it is STREAMED straight from the FEC (only the first zip entry, ~half the archive) and
+// filtered on the fly, so nothing multi-GB lands on disk and only the state's rows are stored.
 //   docker compose exec fec-terminal node scripts/import-fec-bulk.js --cycles 2026,2024
 //
 // Files land in $DATA_DIR/bulk/ and are kept (re-runs skip the download; --fresh re-downloads).
@@ -24,8 +30,9 @@ import fs from "node:fs";
 import path from "node:path";
 import zlib from "node:zlib";
 import readline from "node:readline";
+import { Readable } from "node:stream";
 import { contribUpsertMany, fecCommitteeUpsertMany, fecCandidateUpsertMany,
-         contribStats, fecRefStats, persistent, dbAnalyze } from "../server/db.js";
+         contribStats, fecRefStats, persistent, dbAnalyze, settingSet } from "../server/db.js";
 
 const BASE = "https://www.fec.gov/files/bulk-downloads";
 const PAS2_TYPES = new Set(["24K", "24Z", "24C"]);
@@ -43,9 +50,16 @@ const cycles = [...new Set(opt("--cycles").split(",")
   .map((s) => (s.trim().toLowerCase() === "auto" ? CURRENT_CYCLE : s.trim()))
   .filter((s) => /^\d{4}$/.test(s)))];
 const withOth = flag("--oth");
+const withIndiv = flag("--indiv");
+const INDIV_STATE = (opt("--indiv-state", "TN") || "TN").toUpperCase().slice(0, 2);
+// Receipt types that are contributions from individuals (15 = contribution, 15E = earmarked,
+// 15C = from the candidate, 10/11 = to super PACs / tribal, 3x = convention/recount/HQ accounts).
+// Refunds (2xY) and conduit pass-through lines (24I/24T) are not gifts and are skipped.
+const INDIV_TYPES = new Set(["10", "11", "15", "15C", "15E", "15I", "15T", "30", "30T", "31", "31T", "32", "32T"]);
+const CONDUIT_NAME_RE = /^(ACTBLUE|WINRED|ACT BLUE|DEMOCRACY ENGINE|ANEDOT)\b/;
 const fresh = flag("--fresh");
 if (!cycles.length) {
-  console.log("Usage: node scripts/import-fec-bulk.js --cycles auto,2024[,...] [--oth] [--fresh]");
+  console.log("Usage: node scripts/import-fec-bulk.js --cycles auto,2024[,...] [--oth] [--indiv [--indiv-state TN]] [--fresh]");
   process.exit(1);
 }
 if (!persistent) {
@@ -134,13 +148,13 @@ async function fetchFile(cycle, kind) {
 
 // ---- masters ----
 async function importMasters(cycle) {
-  const cm = new Map(), cn = new Map();
+  const cm = new Map(), cn = new Map(), linked = new Set();
   { // committee master: CMTE_ID|CMTE_NM|TRES|ST1|ST2|CITY|ST|ZIP|DSGN|TP|PTY|FREQ|ORG_TP|CONNECTED|CAND_ID
     const rows = [];
     for await (const line of entryLines(await fetchFile(cycle, "cm"))) {
       const c = line.split("|");
       if (c.length < 15 || !c[0]) continue;
-      cm.set(c[0], { name: c[1], state: c[6], type: c[9] });
+      cm.set(c[0], { name: c[1], state: c[6], type: c[9], candId: c[14] || null });
       rows.push({ cmteId: c[0], name: c[1] || null, type: c[9] || null, designation: c[8] || null,
         party: c[10] || null, state: c[6] || null, connectedOrg: c[13] || null,
         candId: c[14] || null, lastCycle: cycle });
@@ -156,7 +170,7 @@ async function importMasters(cycle) {
     for await (const line of entryLines(await fetchFile(cycle, "cn"))) {
       const c = line.split("|");
       if (c.length < 15 || !c[0]) continue;
-      cn.set(c[0], { name: c[1], pcc: c[9] });
+      cn.set(c[0], { name: c[1], pcc: c[9], state: c[4] });
       rows.push({ candId: c[0], name: c[1] || null, party: c[2] || null, office: c[5] || null,
         state: c[4] || null, district: c[6] || null, pcc: c[9] || null,
         incumbentChallenge: c[7] || null, status: c[8] || null, lastCycle: cycle });
@@ -169,6 +183,8 @@ async function importMasters(cycle) {
     for await (const line of entryLines(await fetchFile(cycle, "ccl"))) {
       const c = line.split("|");
       if (c.length < 7 || !c[0] || !c[3]) continue;
+      // every committee linked to one of the state's candidates (principal, authorized, joint) is in scope for --indiv
+      if (cn.get(c[0])?.state === INDIV_STATE) linked.add(c[3]);
       if (c[5] === "P" && !cn.get(c[0])?.pcc) { // principal designation
         const cur = cn.get(c[0]) || {};
         cn.set(c[0], { ...cur, pcc: c[3] });
@@ -177,7 +193,84 @@ async function importMasters(cycle) {
     }
     if (rows.length) fecCandidateUpsertMany(rows);
   }
-  return { cm, cn };
+  return { cm, cn, linked };
+}
+
+// ---- individual contributions (indiv), streamed and filtered to one state ----
+// Layout: CMTE_ID|AMNDT_IND|RPT_TP|TRANSACTION_PGI|IMAGE_NUM|TRANSACTION_TP|ENTITY_TP|NAME|CITY|
+//         STATE|ZIP_CODE|EMPLOYER|OCCUPATION|TRANSACTION_DT|TRANSACTION_AMT|OTHER_ID|TRAN_ID|
+//         FILE_NUM|MEMO_CD|MEMO_TEXT|SUB_ID
+// indivYY.zip holds itcont.txt first, then the same rows again split by date — so only the first
+// entry is requested (HTTP Range), inflated and read line by line.
+async function remoteFirstEntryLines(url) {
+  const probe = await fetch(url, { headers: { Range: "bytes=0-2047" } });
+  if (!probe.ok) throw new Error(`${url} → HTTP ${probe.status}`);
+  const finalUrl = probe.url || url;
+  const h = Buffer.from(await probe.arrayBuffer());
+  if (h.length < 30 || h.readUInt32LE(0) !== 0x04034b50) throw new Error("indiv zip: bad local header");
+  const flags = h.readUInt16LE(6), method = h.readUInt16LE(8);
+  const fnLen = h.readUInt16LE(26), exLen = h.readUInt16LE(28);
+  const name = h.subarray(30, 30 + fnLen).toString("latin1");
+  if (!/itcont\.txt$/i.test(name)) throw new Error(`indiv zip: first entry is "${name}", expected itcont.txt — archive layout changed`);
+  if (method !== 8) throw new Error(`indiv zip: unexpected compression method ${method}`);
+  let csize = h.readUInt32LE(18);
+  if (csize === 0xFFFFFFFF) { // zip64: sizes live in the extra field (id 0x0001: usize u64, csize u64)
+    let o = 30 + fnLen; const end = o + exLen; csize = 0;
+    while (o + 4 <= end) {
+      const id = h.readUInt16LE(o), len = h.readUInt16LE(o + 2);
+      if (id === 0x0001 && len >= 16) { csize = Number(h.readBigUInt64LE(o + 12)); break; }
+      o += 4 + len;
+    }
+  }
+  if (!csize || (flags & 8)) throw new Error("indiv zip: entry size not in the local header — cannot range-read it");
+  const start = 30 + fnLen + exLen;
+  const res = await fetch(finalUrl, { headers: { Range: `bytes=${start}-${start + csize - 1}` } });
+  if (res.status !== 206) throw new Error(`${finalUrl} → HTTP ${res.status} (range request refused)`);
+  const stream = Readable.fromWeb(res.body).pipe(zlib.createInflateRaw());
+  stream.setEncoding("latin1");
+  return { lines: readline.createInterface({ input: stream, crlfDelay: Infinity }), compressedMB: csize / 1e6 };
+}
+
+async function importIndiv(cycle, cm, linked) {
+  const yy = String(cycle).slice(2);
+  // in-scope committees: based in the state, or linked to one of its candidates
+  const inScope = new Set(linked);
+  const conduits = new Set();
+  for (const [id, c] of cm) {
+    if (c.state === INDIV_STATE) inScope.add(id);
+    if (CONDUIT_NAME_RE.test(String(c.name || "").toUpperCase())) conduits.add(id);
+  }
+  const { lines, compressedMB } = await remoteFirstEntryLines(`${BASE}/${cycle}/indiv${yy}.zip`);
+  console.log(`  indiv${yy}: streaming ${compressedMB.toFixed(0)} MB (compressed) · scope ${INDIV_STATE}: ${inScope.size.toLocaleString()} committees + all ${INDIV_STATE} residents`);
+  let scanned = 0, kept = 0, toState = 0, malformed = 0, batch = [];
+  const flush = () => { if (batch.length) { contribUpsertMany(batch); batch = []; } };
+  for await (const line of lines) {
+    const c = line.split("|");
+    if (c.length < 21 || !c[0] || !c[20]) { if (line) malformed++; continue; }
+    scanned++;
+    const mine = inScope.has(c[0]);
+    if (!mine && c[9] !== INDIV_STATE) continue;
+    if (conduits.has(c[0]) || !INDIV_TYPES.has(c[5]) || !c[7]) continue;
+    const committee = cm.get(c[0]) || {};
+    batch.push({
+      source: "fec", subId: c[20], kind: "contribution",
+      donorKey: normKey(c[7], c[9]), donorName: c[7],
+      employer: c[11] || null, occupation: c[12] || null, city: c[8] || null, state: c[9] || null, zip: c[10] || null,
+      entityType: c[6] || "IND",
+      recipientId: c[0], recipientName: committee.name || null, candidateId: committee.candId || null,
+      cycle, date: bulkDate(c[13]), amount: Number(c[14]) || 0, memo: c[18] === "X",
+    });
+    kept++; if (mine) toState++;
+    if (batch.length >= BATCH) flush();
+    if (scanned % 500000 === 0) process.stdout.write(`\r  indiv${yy}: ${kept.toLocaleString()} kept / ${(scanned / 1e6).toFixed(1)}M scanned`);
+  }
+  flush();
+  console.log(`\r  indiv${yy}: ${kept.toLocaleString()} kept / ${scanned.toLocaleString()} scanned (${toState.toLocaleString()} to ${INDIV_STATE} committees)`);
+  if (scanned < 100000) throw new Error(`indiv${yy}: only ${scanned.toLocaleString()} rows parsed — truncated download or format change`);
+  if (malformed > scanned * 0.2) throw new Error(`indiv${yy}: ${malformed.toLocaleString()} malformed rows — likely column-layout change, aborting`);
+  // coverage marker: these committees' itemized individual donors are complete as of now
+  settingSet(`bulkIndiv:${cycle}`, JSON.stringify({ at: Date.now(), state: INDIV_STATE, kept, scanned, committees: inScope.size }));
+  settingSet(`bulkIndivCmtes:${cycle}`, JSON.stringify([...inScope]));
 }
 
 // ---- transaction files ----
@@ -231,13 +324,24 @@ async function importTransactions(cycle, kind, cm, cn) {
 }
 
 // ---- main ----
-console.log(`FEC bulk import → ${DATA_DIR} | cycles: ${cycles.join(", ")}${withOth ? " | +oth (committee→committee)" : ""}`);
+console.log(`FEC bulk import → ${DATA_DIR} | cycles: ${cycles.join(", ")}${withOth ? " | +oth (committee→committee)" : ""}${withIndiv ? ` | +indiv (${INDIV_STATE} individual donors)` : ""}`);
 const t0 = Date.now();
 for (const cycle of cycles) {
   console.log(`\ncycle ${cycle}:`);
-  const { cm, cn } = await importMasters(cycle);
+  const { cm, cn, linked } = await importMasters(cycle);
   await importTransactions(cycle, "pas2", cm, cn);
   if (withOth) await importTransactions(cycle, "oth", cm, cn);
+  if (withIndiv) {
+    // a dropped connection mid-stream restarts the pass — upserts are idempotent (keyed on SUB_ID)
+    for (let attempt = 1; ; attempt++) {
+      try { await importIndiv(cycle, cm, linked); break; }
+      catch (e) {
+        if (attempt >= 3) throw e;
+        console.log(`\n  indiv${String(cycle).slice(2)}: ${e.message} — retrying (${attempt}/3)`);
+        await new Promise((r) => setTimeout(r, 15000));
+      }
+    }
+  }
 }
 process.stdout.write("running ANALYZE so SQLite plans queries well at this scale… ");
 console.log(dbAnalyze() ? "done" : "skipped");

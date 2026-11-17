@@ -9,11 +9,15 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { fmtUSD, fmtUSDshort, fmtNum, timeAgo, partyColor, downloadCSV, getJSON } from "./lib.js";
 
 const SECTIONS = [
-  ["candidate", "Candidate donors"],
+  ["candidate", "Candidate"],
   ["registry", "Registry"],
   ["directory", "Directory"],
   ["money", "Money search"],
   ["filings", "Filings"],
+  ["outside", "Outside spending"],
+  ["place", "By place"],
+  ["lobby", "Lobbying"],
+  ["leg", "Legislature"],
   ["races", "Federal races"],
   ["dollars", "Federal dollars"],
 ];
@@ -150,6 +154,7 @@ function Directory({ meta, onOpenEntity }) {
         )}
         {sync?.errors?.length > 0 && <div className="tx-note warn">{sync.errors.slice(-3).join(" · ")}</div>}
       </div>
+      <AutoCheck />
 
       <div className="tx-panel">
         <div className="tx-form">
@@ -413,8 +418,8 @@ function MoneySearch({ meta, onOpenEntity }) {
           {data.note && <div className="tx-note warn">{data.note}</div>}
           {data.truncated && (
             <div className="fec-error" role="status">
-              At least one year came back with exactly 500 rows. TREF stops a search at 500 without saying so, so these totals are incomplete —
-              narrow it with a report type, an amount, or a ZIP. For one candidate’s complete donor list use Candidate donors, which reads the filed reports instead.
+              TREF stops a search at 500 rows without saying so. This search hit that limit even after being split by report type, so the totals are incomplete —
+              narrow it with an amount or a ZIP. For one candidate’s complete donor list use the Candidate section, which reads the filed reports instead.
             </div>
           )}
           {data.count === 0 && <div className="fec-empty">No transactions match. Try fewer filters, another report year, or leave “Match anywhere in a name” on.</div>}
@@ -848,12 +853,169 @@ function FederalDollars({ meta }) {
 }
 
 // =============================================================================================
-//  Candidate donors — one name in, every donor out (federal + state)
+//  Candidate — one name in; donors, geography, employers × federal awards, spending out
 // =============================================================================================
 const post = (url, body) => getJSON(url, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
 const officeName = (o) => (o === "S" ? "U.S. Senate" : o === "H" ? "U.S. House" : o === "P" ? "President" : o);
+const dateOf = (ms) => (ms ? new Date(ms).toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" }) : "");
 
-function CandidateDonors({ onOpenDonor }) {
+function CandidateGeo({ body }) {
+  const [d, setD] = useState(null); const [err, setErr] = useState(null);
+  useEffect(() => { let live = true; post("/api/tn/candidate/geo", body).then((x) => live && setD(x)).catch((e) => live && setErr(e.message)); return () => { live = false; }; /* eslint-disable-next-line */ }, []);
+  if (err) return <div className="fec-error" role="alert">{err}</div>;
+  if (!d) return <div className="fec-empty"><span className="fec-spin">Working out where the money comes from</span></div>;
+  const known = d.inState + d.outState || 1;
+  return (
+    <>
+      <div className="tx-kpis">
+        <div className="tx-kpi"><span>From Tennessee</span><b>{fmtUSD(d.inState)}</b><small>{Math.round((d.inState / known) * 100)}% of money from people</small></div>
+        <div className="tx-kpi"><span>From other states</span><b>{fmtUSD(d.outState)}</b><small>{Math.round((d.outState / known) * 100)}%</small></div>
+        {d.unknown > 0 && <div className="tx-kpi"><span>No address on record</span><b>{fmtUSD(d.unknown)}</b></div>}
+        {d.orgs > 0 && <div className="tx-kpi"><span>From committees and businesses</span><b>{fmtUSD(d.orgs)}</b><small>not mapped — people only below</small></div>}
+      </div>
+      {d.note && <div className="tx-note warn">{d.note}</div>}
+      <div className="tx-cols">
+        <Rank title="Tennessee counties" items={d.counties.slice(0, 25).map((c) => ({ ...c, count: c.donors }))} />
+        <Rank title="States" items={d.states.slice(0, 20).map((c) => ({ ...c, count: c.donors }))} color="var(--olive)" />
+        <Rank title="Tennessee ZIP codes" items={d.zips.slice(0, 20).map((z) => ({ ...z, name: `${z.name}${z.city ? ` · ${z.city}` : ""}`, count: z.donors }))} color="var(--muted)" />
+        <Rank title="Tennessee cities" items={d.cities.slice(0, 20).map((c) => ({ ...c, count: c.donors }))} color="var(--muted)" />
+      </div>
+      {d.tnWithoutCounty > 0 && <div className="tx-note">{fmtUSD(d.tnWithoutCounty)} from Tennessee donors has no ZIP stored, so it is in the state total but not assigned to a county. Federal rows gain ZIPs once the bulk file is loaded.</div>}
+    </>
+  );
+}
+
+function CandidateEmployers({ body }) {
+  const fyNow = (() => { const t = new Date(); return t.getMonth() >= 9 ? t.getFullYear() + 1 : t.getFullYear(); })();
+  const [fy, setFy] = useState(String(fyNow - 1));
+  const [d, setD] = useState(null); const [err, setErr] = useState(null);
+  useEffect(() => { let live = true; setD(null); setErr(null); post("/api/tn/candidate/employers", { ...body, fy }).then((x) => live && setD(x)).catch((e) => live && setErr(e.message)); return () => { live = false; }; /* eslint-disable-next-line */ }, [fy]);
+  return (
+    <>
+      <p className="tx-lede" style={{ marginTop: 14 }}>
+        Donors rolled up by employer (and PACs by their sponsoring organization), matched against organizations that received
+        federal contracts, grants or loans <b>performed in Tennessee</b> that fiscal year. A match shows that both things are true — not that one caused the other.
+      </p>
+      <div className="fec-status">
+        <select className="fec-modelsel" value={fy} onChange={(e) => setFy(e.target.value)} aria-label="Fiscal year" style={{ fontSize: 14, padding: "6px 8px" }}>
+          {Array.from({ length: 8 }, (_, i) => String(fyNow - 1 - i)).map((y) => <option key={y} value={y}>Federal awards in FY {y}</option>)}
+        </select>
+        {d && <span>{fmtNum(d.totals.matched)} of {fmtNum(d.totals.employers)} employers matched · {fmtNum(d.recipientsIndexed)} award recipients checked</span>}
+      </div>
+      {err && <div className="fec-error" role="alert">{err}</div>}
+      {!d && !err && <div className="fec-empty"><span className="fec-spin">Matching employers to federal award recipients (the first run for a year takes about 15 seconds)</span></div>}
+      {d && (
+        <>
+          {d.note && <div className="tx-note warn">{d.note}</div>}
+          <div className="tx-kpis">
+            <div className="tx-kpi"><span>Given by matched employers</span><b>{fmtUSD(d.totals.givenByMatched)}</b><small>employees and PACs combined</small></div>
+            <div className="tx-kpi"><span>Federal awards to them</span><b>{fmtUSDshort(d.totals.awardsToMatched)}</b><small>in Tennessee, FY {d.fy}</small></div>
+          </div>
+          {d.matched.length === 0 && <div className="fec-empty">None of this candidate’s donor employers matched a federal award recipient in Tennessee for FY {d.fy}.</div>}
+          {d.matched.length > 0 && (
+            <div className="tx-panel" style={{ padding: 0, overflow: "hidden" }}>
+              <div className="fec-table-wrap">
+                <table className="fec-table">
+                  <thead><tr><th>Employer or organization</th><th className="amt">Federal awards in TN</th><th className="amt">Gave this candidate</th><th>From</th><th>Match</th></tr></thead>
+                  <tbody>
+                    {d.matched.map((e) => (
+                      <tr key={e.key}>
+                        <td><b style={{ fontWeight: 600 }}>{e.employer}</b>{e.award.recipient.toUpperCase() !== String(e.employer).toUpperCase() && <div className="sub">award recipient: {e.award.recipient}</div>}</td>
+                        <td className="amt">{fmtUSD(e.award.amount)}</td>
+                        <td className="amt">{fmtUSD(e.total)}</td>
+                        <td className="sub">{[e.people ? `${e.people} employee${e.people === 1 ? "" : "s"} (${fmtUSDshort(e.peopleTotal)})` : "", e.orgTotal ? `its PAC or the organization (${fmtUSDshort(e.orgTotal)})` : ""].filter(Boolean).join(" + ")}
+                          {e.donors.length > 0 && <div>{e.donors.slice(0, 3).map((x) => x.name).join(" · ")}</div>}</td>
+                        <td><span className={`tx-pill${e.award.match === "exact" ? " win" : ""}`}>{e.award.match === "exact" ? "name match" : "likely"}</span></td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
+          {d.lobbying && (d.lobbying.employers.length > 0 || d.lobbying.lobbyists.length > 0) && (
+            <div className="tx-panel">
+              <h3>State lobbying ties <span className="sub" style={{ fontFamily: "var(--font-ui)", fontWeight: 400 }}>· Ethics Commission roster{d.lobbying.year ? `, ${d.lobbying.year}` : ""}</span></h3>
+              <div className="tx-kpis" style={{ marginTop: 0 }}>
+                <div className="tx-kpi"><span>Donor employers that retain state lobbyists</span><b>{fmtNum(d.lobbying.totals.employers)}</b><small>{fmtUSD(d.lobbying.totals.employerGiving)} given</small></div>
+                <div className="tx-kpi"><span>Registered lobbyists among donors</span><b>{fmtNum(d.lobbying.totals.lobbyists)}</b><small>{fmtUSD(d.lobbying.totals.lobbyistGiving)} given · strong matches only</small></div>
+              </div>
+              <div className="tx-cols">
+                <div style={{ minWidth: 0 }}>
+                  <div className="sub" style={{ marginBottom: 4 }}>Employers and PACs with lobbyists at the capitol</div>
+                  <ol className="tx-rank">{d.lobbying.employers.slice(0, 20).map((e) => (
+                    <li key={e.key}><span className="nm" title={e.lobby.name}>{e.employer}<span className="sub"> · {e.people ? `${e.people} employee${e.people === 1 ? "" : "s"}` : "organization"}</span></span><span className="amt">{fmtUSDshort(e.total)}</span></li>
+                  ))}</ol>
+                </div>
+                <div style={{ minWidth: 0 }}>
+                  <div className="sub" style={{ marginBottom: 4 }}>Donors who share a name with a registered lobbyist</div>
+                  <ol className="tx-rank">{d.lobbying.lobbyists.slice(0, 20).map((l, i) => (
+                    <li key={`${l.name}-${i}`}><span className="nm">{l.name}<span className="sub"> · {[l.occupation, l.employer].filter(Boolean).join(", ") || [l.city, l.st].filter(Boolean).join(", ")}</span>{" "}
+                      <span className={`tx-pill${l.confidence === "strong" ? " win" : ""}`}>{l.confidence === "strong" ? "lobbyist" : "same name"}</span></span><span className="amt">{fmtUSDshort(l.total)}</span></li>
+                  ))}</ol>
+                </div>
+              </div>
+              <div className="tx-note">“Lobbyist” = the name matches and either the donor’s occupation says so or the city matches the registration. “Same name” alone may be a different person.</div>
+            </div>
+          )}
+          <div className="tx-cols">
+            <Rank title="Largest employers among donors" items={d.employers.slice(0, 25).map((e) => ({ name: e.employer, total: e.total, count: e.people || undefined }))} color="var(--muted)" />
+          </div>
+          <div className="tx-note">“Likely” means one name begins with the other (for example a parent company and a subsidiary). Awards are counted by place of performance, so a national contractor with no Tennessee work will not match.</div>
+        </>
+      )}
+    </>
+  );
+}
+
+// Shows the legislator card only when the member holding that seat has the candidate's surname
+// (a challenger for the same district must not be shown the incumbent's record).
+function SeatCard({ chamber, district, surname }) {
+  const [ok, setOk] = useState(false);
+  useEffect(() => { let live = true; getJSON(`/api/tn/legislature/member?${qsOf({ chamber, district })}`).then((m) => { if (live) setOk(String(m.name || "").toUpperCase().startsWith(surname)); }).catch(() => {}); return () => { live = false; }; }, [chamber, district, surname]);
+  return ok ? <LegislatorCard chamber={chamber} district={district} compact /> : null;
+}
+
+function CandidateSpending({ body }) {
+  const [d, setD] = useState(null); const [err, setErr] = useState(null);
+  useEffect(() => { let live = true; post("/api/tn/candidate/spending", body).then((x) => live && setD(x)).catch((e) => live && setErr(e.message)); return () => { live = false; }; /* eslint-disable-next-line */ }, []);
+  if (err) return <div className="fec-error" role="alert">{err}</div>;
+  if (!d) return <div className="fec-empty"><span className="fec-spin">Reading spending</span></div>;
+  const against = d.outside.filter((o) => !o.support), forC = d.outside.filter((o) => o.support);
+  return (
+    <>
+      <div className="tx-kpis">
+        <div className="tx-kpi"><span>State account, itemized spending</span><b>{fmtUSD(d.state.total)}</b></div>
+        <div className="tx-kpi"><span>Federal, largest payments</span><b>{fmtUSD(d.federal.total)}</b>{d.federal.partial && <small>top 100 per period only</small>}</div>
+        <div className="tx-kpi"><span>Outside money for</span><b>{fmtUSD(forC.reduce((a, o) => a + o.total, 0))}</b><small>federal independent expenditures</small></div>
+        <div className="tx-kpi"><span>Outside money against</span><b>{fmtUSD(against.reduce((a, o) => a + o.total, 0))}</b></div>
+      </div>
+      {d.notes.length > 0 && <div className="tx-note warn">{d.notes.join(" · ")}</div>}
+      <div className="tx-cols">
+        <Rank title="State account — paid to" items={d.state.vendors} />
+        <Rank title="State account — purposes" items={d.state.purposes} color="var(--muted)" />
+        <Rank title="Federal committees — paid to" items={d.federal.payees} color="var(--olive)" />
+        <Rank title="Federal committees — purposes" items={d.federal.purposes} color="var(--muted)" />
+      </div>
+      {d.outside.length > 0 && (
+        <div className="tx-panel" style={{ padding: 0, overflow: "hidden" }}>
+          <h3 className="tx-h" style={{ padding: "12px 16px 0" }}>Outside spending on the federal race</h3>
+          <div className="fec-table-wrap">
+            <table className="fec-table">
+              <thead><tr><th>Spender</th><th>Position</th><th>Period</th><th className="amt">Spent</th></tr></thead>
+              <tbody>{d.outside.slice(0, 40).map((o, i) => (
+                <tr key={i}><td>{o.committee}</td><td><span className={`tx-pill${o.support ? " win" : ""}`} style={o.support ? undefined : { borderColor: "var(--rose)", color: "var(--rose)" }}>{o.support ? "supports" : "opposes"}</span></td>
+                  <td className="sub">{Number(o.cycle) - 1}–{o.cycle}</td><td className="amt">{fmtUSD(o.total)}</td></tr>
+              ))}</tbody>
+            </table>
+          </div>
+        </div>
+      )}
+    </>
+  );
+}
+
+function CandidateDonors({ onOpenDonor, seed }) {
   const [q, setQ] = useState("");
   const [finding, setFinding] = useState(false);
   const [found, setFound] = useState(null);
@@ -862,16 +1024,19 @@ function CandidateDonors({ onOpenDonor }) {
   const [cycles, setCycles] = useState([]);
   const [who, setWho] = useState("all"); // all | people | orgs
   const [data, setData] = useState(null);
+  const [stamp, setStamp] = useState(0);   // bumps when a new donor set is loaded → sub-views refetch
+  const [view, setView] = useState("donors");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
   const [job, setJob] = useState(null);
+  const [bulk, setBulk] = useState(null);
   const [filter, setFilter] = useState("");
   const [src, setSrc] = useState("all");
   const [page, setPage] = useState(0);
   const PER = 100;
-  const pollRef = useRef(null);
+  const pollRef = useRef(null), bulkRef = useRef(null);
   const lastDone = useRef(0);
-  useEffect(() => () => clearTimeout(pollRef.current), []);
+  useEffect(() => () => { clearTimeout(pollRef.current); clearTimeout(bulkRef.current); }, []);
 
   const allCommittees = useMemo(() => (found?.federal || []).flatMap((c) => c.committees.map((pc) => ({ ...pc, cand: c }))), [found]);
   const cycleOpts = useMemo(() => {
@@ -880,15 +1045,16 @@ function CandidateDonors({ onOpenDonor }) {
     return [...set].sort().reverse().slice(0, 8);
   }, [found, selFed]);
 
-  const find = async () => {
-    if (q.trim().length < 2) return;
-    setFinding(true); setError(null); setData(null); setFound(null);
+  const find = async (override) => {
+    const name = (typeof override === "string" ? override : q).trim();
+    if (name.length < 2) return;
+    setFinding(true); setError(null); setData(null); setFound(null); setView("donors");
     try {
-      const d = await getJSON(`/api/tn/candidate/find?q=${encodeURIComponent(q.trim())}`);
+      const d = await getJSON(`/api/tn/candidate/find?q=${encodeURIComponent(name)}`);
       setFound(d);
-      // preselect: the most recently active federal candidacy and the most recent state account
+      // preselect the active federal candidacy's principal committee and the most recent state account
       const f = {}; const top = d.federal[0];
-      if (top) for (const pc of top.committees) f[pc.id] = true;
+      if (top) for (const pc of top.committees) if (pc.role === "principal") f[pc.id] = true;
       setSelFed(f);
       setSelState(d.state[0] ? { [d.state[0].tnId]: true } : {});
       setCycles(top ? top.cycles.slice(0, 2) : []);
@@ -896,16 +1062,22 @@ function CandidateDonors({ onOpenDonor }) {
     finally { setFinding(false); }
   };
 
+  useEffect(() => { if (seed?.name) { setQ(seed.name); find(seed.name); } /* eslint-disable-next-line */ }, [seed?.t]);
+  // sitting legislators among the selected state accounts → committee seats and bills
+  const seats = (found?.state || []).filter((s) => selState[s.tnId] && /^(senate|house)/i.test(s.office || "") && /^\d+$/.test(String(s.district || "").trim()))
+    .map((s) => ({ chamber: /^senate/i.test(s.office) ? "S" : "H", district: String(Number(s.district)), surname: s.name.split(",")[0].trim().toUpperCase() }));
+
   const body = () => {
     const committees = Object.keys(selFed).filter((k) => selFed[k]);
     const state = (found?.state || []).filter((s) => selState[s.tnId]).map((s) => ({ tnId: s.tnId, name: s.name }));
-    return { committees, cycles: cycles.filter((c) => cycleOpts.includes(c)), state };
+    const candIds = (found?.federal || []).filter((c) => c.committees.some((pc) => selFed[pc.id])).map((c) => c.candId);
+    return { committees, cycles: cycles.filter((c) => cycleOpts.includes(c)), state, candIds };
   };
 
   const loadDonors = async (quiet = false) => {
     if (!quiet) { setLoading(true); setPage(0); }
     setError(null);
-    try { const d = await post("/api/tn/candidate/donors", body()); setData(d); return d; }
+    try { const d = await post("/api/tn/candidate/donors", body()); setData(d); setStamp(Date.now()); return d; }
     catch (e) { setError(e.message); return null; }
     finally { if (!quiet) setLoading(false); }
   };
@@ -925,8 +1097,22 @@ function CandidateDonors({ onOpenDonor }) {
     try { await post("/api/tn/candidate/pull", { committees: b.committees, cycles: b.cycles, full }); lastDone.current = 0; clearTimeout(pollRef.current); poll(); }
     catch (e) { setError(e.message); }
   };
+  // the fast path to "every donor": stream the FEC bulk file for the selected periods
+  const pollBulk = async () => {
+    try {
+      const s = await getJSON("/api/admin/bulk-import");
+      setBulk(s);
+      if (s.running) bulkRef.current = setTimeout(pollBulk, 3000); else loadDonors(true);
+    } catch { /* retry on next click */ }
+  };
+  const startBulk = async () => {
+    const b = body();
+    try { await post("/api/admin/bulk-import", { cycles: b.cycles, oth: false, indiv: true }); setBulk({ running: true, log: [] }); clearTimeout(bulkRef.current); bulkRef.current = setTimeout(pollBulk, 2000); }
+    catch (e) { setError(e.message); }
+  };
 
   const show = async () => {
+    setView("donors");
     const d = await loadDonors();
     // first look at a committee: fetch its largest itemized receipts in the background
     if (d?.coverage?.some((c) => !c.complete && c.available == null)) startPull(false);
@@ -938,34 +1124,32 @@ function CandidateDonors({ onOpenDonor }) {
     return (data?.donors || []).filter((d) =>
       (src === "all" || (src === "federal" && d.federal) || (src === "state" && d.stateAmt) || (src === "both" && d.federal && d.stateAmt)) &&
       (who === "all" || (who === "people") === isPerson(d)) &&
-      (!f || `${d.name} ${d.employer} ${d.occupation} ${d.city} ${d.st}`.toUpperCase().includes(f)));
+      (!f || `${d.name} ${d.employer} ${d.occupation} ${d.city} ${d.st} ${d.zip}`.toUpperCase().includes(f)));
   }, [data, filter, src, who]);
   useEffect(() => { setPage(0); }, [filter, src, who]);
   const hasFed = Object.values(selFed).some(Boolean), hasState = Object.values(selState).some(Boolean);
   const incomplete = (data?.coverage || []).filter((c) => !c.complete);
   const remaining = incomplete.reduce((a, c) => a + Math.max(0, (c.available || 0) - c.stored), 0);
   const exportCsv = () => downloadCSV(`donors_${(found?.q || "candidate").replace(/\W+/g, "_")}.csv`,
-    ["donor", "city", "state", "employer", "occupation", "type", "federal_total", "state_total", "total", "gifts", "first_gift", "last_gift"],
-    rows.map((d) => [d.name, d.city, d.st, d.employer, d.occupation, d.type, d.federal, d.stateAmt, d.total, d.count, d.firstDate, d.lastDate]));
+    ["donor", "city", "state", "zip", "employer", "occupation", "type", "federal_total", "state_total", "total", "gifts", "first_gift", "last_gift", "also_written_as"],
+    rows.map((d) => [d.name, d.city, d.st, d.zip, d.employer, d.occupation, d.type, d.federal, d.stateAmt, d.total, d.count, d.firstDate, d.lastDate, (d.names || []).filter((n) => n !== d.name).join(" | ")]));
 
   return (
     <>
       <p className="tx-lede">
-        Type a Tennessee candidate’s name to get <b>one donor list</b> covering their federal committees (FEC) and their state campaign
-        account (TREF). Someone like a sitting senator running for governor has both — this puts them side by side.
+        Type a Tennessee candidate’s name to open <b>one page</b> for them: every donor across their federal committees (FEC) and state
+        campaign account (TREF), where that money comes from, which donors’ employers receive federal dollars, and where the campaign spends.
       </p>
       <div className="tx-panel">
         <div style={{ display: "flex", gap: 8, maxWidth: 640 }}>
           <input value={q} onChange={(e) => setQ(e.target.value)} onKeyDown={(e) => e.key === "Enter" && find()} aria-label="Candidate name"
             placeholder="Candidate name — e.g. Marsha Blackburn"
             style={{ flex: 1, background: "var(--ink)", color: "var(--bone)", border: "1px solid var(--line)", padding: "8px 12px", fontSize: 14 }} />
-          <button className="fec-btn" onClick={find} disabled={finding || q.trim().length < 2}>{finding ? "Looking…" : "Find candidate"}</button>
+          <button className="fec-btn" onClick={() => find()} disabled={finding || q.trim().length < 2}>{finding ? "Looking…" : "Find candidate"}</button>
         </div>
 
         {found && !found.federal.length && !found.state.length && (
-          <div className="tx-note warn" style={{ marginTop: 12 }}>
-            No Tennessee candidate matches “{found.q}”. Try the last name alone. {found.notes.join(" ")}
-          </div>
+          <div className="tx-note warn" style={{ marginTop: 12 }}>No Tennessee candidate matches “{found.q}”. Try the last name alone. {found.notes.join(" ")}</div>
         )}
         {found && (found.federal.length > 0 || found.state.length > 0) && (
           <div className="tx-cols" style={{ marginTop: 14 }}>
@@ -975,15 +1159,19 @@ function CandidateDonors({ onOpenDonor }) {
               {found.federal.map((c) => (
                 <div key={c.candId} style={{ marginBottom: 10, paddingLeft: 9, borderLeft: `3px solid ${partyColor(c.party)}` }}>
                   <div><b style={{ fontWeight: 600 }}>{c.name}</b> <span className="sub">· {officeName(c.office)}{c.district && c.district !== "00" ? ` TN-${c.district}` : ""} · {c.cycles[c.cycles.length - 1]}–{c.cycles[0]}</span></div>
-                  {!c.committees.length && <div className="sub">No principal committee registered.</div>}
+                  {!c.committees.length && <div className="sub">No committee of its own (shares the one above).</div>}
                   {c.committees.map((pc) => (
                     <label key={pc.id} className="fec-check" style={{ marginTop: 4 }}>
                       <input type="checkbox" checked={!!selFed[pc.id]} onChange={(e) => setSelFed((p) => ({ ...p, [pc.id]: e.target.checked }))} />
-                      <span style={{ color: "var(--bone)" }}>{pc.name}</span> <span className="sub">{pc.id}</span>
+                      <span style={{ color: "var(--bone)" }}>{pc.name}</span>
+                      <span className={`tx-pill${pc.role === "principal" ? " win" : ""}`}>{pc.role}</span>
                     </label>
                   ))}
                 </div>
               ))}
+              {allCommittees.some((c) => c.role !== "principal") && (
+                <div className="sub" style={{ marginBottom: 6 }}>Tick a joint fundraising committee or leadership PAC to see the people behind it; its transfers to the campaign are then left out so nothing is counted twice.</div>
+              )}
               {hasFed && cycleOpts.length > 0 && (
                 <div style={{ marginTop: 8 }}>
                   <div className="sub" style={{ marginBottom: 5 }}>Two-year periods to include</div>
@@ -1013,7 +1201,7 @@ function CandidateDonors({ onOpenDonor }) {
             </div>
             <div className="full" style={{ gridColumn: "1 / -1", display: "flex", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
               <button className="fec-btn" onClick={show} disabled={loading || (!hasFed && !hasState) || (hasFed && !hasState && !cycles.length)}>
-                {loading ? "Gathering donors…" : "Show donors"}</button>
+                {loading ? "Gathering donors…" : "Open candidate page"}</button>
               {found.notes.length > 0 && <span className="tx-note warn" style={{ margin: 0 }}>{found.notes.join(" ")}</span>}
             </div>
           </div>
@@ -1028,10 +1216,21 @@ function CandidateDonors({ onOpenDonor }) {
             <div className="tx-kpi"><span>Donors</span><b>{fmtNum(data.totals.donors)}</b><small>{fmtNum(data.totals.gifts)} itemized gifts</small></div>
             <div className="tx-kpi"><span>Federal, itemized</span><b>{fmtUSD(data.totals.federal)}</b><small>FEC Schedule A</small></div>
             <div className="tx-kpi"><span>State, itemized</span><b>{fmtUSD(data.totals.state)}</b><small>TREF reports</small></div>
-            <div className="tx-kpi"><span>Gave to both</span><b>{fmtNum(data.totals.both)}</b><small>same name and state</small></div>
+            <div className="tx-kpi"><span>Gave to both</span><b>{fmtNum(data.totals.both)}</b><small>federal and state</small></div>
           </div>
 
-          {(data.coverage.length > 0 || data.stateAccounts.length > 0) && (
+          <div className="tx-subnav" role="tablist" aria-label="Candidate views" style={{ display: "inline-flex" }}>
+            {[["donors", "Donors"], ["geo", "Where it comes from"], ["employers", "Employers, federal awards, lobbying"], ["spending", "Spending and outside money"]].map(([v, l]) => (
+              <button key={v} role="tab" aria-selected={view === v} onClick={() => setView(v)}>{l}</button>
+            ))}
+          </div>
+
+          {view === "donors" && seats.slice(0, 2).map((s) => <SeatCard key={`${s.chamber}${s.district}`} {...s} />)}
+          {view === "geo" && <CandidateGeo key={`g${stamp}`} body={body()} />}
+          {view === "employers" && <CandidateEmployers key={`e${stamp}`} body={body()} />}
+          {view === "spending" && <CandidateSpending key={`s${stamp}`} body={body()} />}
+
+          {view === "donors" && (data.coverage.length > 0 || data.stateAccounts.length > 0) && (
             <div className="tx-panel">
               <h3>What this list covers</h3>
               {data.coverage.map((c) => {
@@ -1039,8 +1238,8 @@ function CandidateDonors({ onOpenDonor }) {
                 const stored = Math.max(c.stored, live?.pulled || 0), avail = live?.available ?? c.available;
                 return (
                   <div key={`${c.committee}-${c.cycle}`} style={{ fontSize: 13, padding: "4px 0" }}>
-                    <b style={{ fontWeight: 600 }}>{allCommittees.find((x) => x.id === c.committee)?.name || c.committee}</b> · {Number(c.cycle) - 1}–{c.cycle}:{" "}
-                    {c.complete ? <span style={{ color: "var(--olive)" }}>all {fmtNum(c.stored)} itemized rows stored</span>
+                    <b style={{ fontWeight: 600 }}>{c.name}</b> · {Number(c.cycle) - 1}–{c.cycle}:{" "}
+                    {c.complete ? <span style={{ color: "var(--olive)" }}>all {fmtNum(c.stored)} itemized rows stored{c.via === "bulk" ? ` · FEC bulk file, loaded ${dateOf(c.asOf)}` : ""}</span>
                       : avail != null ? <span>{fmtNum(stored)} of {fmtNum(avail)} itemized rows stored, largest first</span>
                       : <span className="sub">{fmtNum(stored)} rows stored so far — checking the FEC for the rest</span>}
                     {live && !live.done && avail ? <div className="tx-progress" style={{ maxWidth: 360 }}><i style={{ width: `${Math.min(100, (stored / avail) * 100)}%` }} /></div> : null}
@@ -1057,74 +1256,399 @@ function CandidateDonors({ onOpenDonor }) {
                       {a.years.length > 0 && <span className="sub"> · {a.years.map((y) => `${y.year}: ${fmtNum(y.count)} gifts`).join(", ")}</span>}
                     </span>
                   )}
-                  {a.partial && !a.error && <span className="sub"> — press Show donors again to read the rest.</span>}
+                  {a.partial && !a.error && <span className="sub"> — open the page again to read the rest.</span>}
                   {a.note && <div className="tx-note warn">{a.note}</div>}
                 </div>
               ))}
               {job?.running && <div className="tx-note">{job.status || `Pulling ${job.current || ""} from the FEC — the list below updates as rows arrive.`}</div>}
               {job && !job.running && job.errors?.length > 0 && <div className="tx-note warn">{job.errors.join(" · ")}</div>}
-              {!job?.running && incomplete.length > 0 && remaining > 0 && (
-                <div style={{ marginTop: 10, display: "flex", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
-                  <button className="fec-btn ghost" onClick={() => startPull(true)}>Pull the remaining {fmtNum(remaining)} rows</button>
-                  <span className="sub">About {fmtNum(Math.ceil(remaining / 100))} FEC requests (100 rows each; the key allows 1,000 an hour, and the pull waits out the limit). Runs in the background and is stored for good.</span>
+              {bulk?.running && <div className="tx-note">Loading the FEC bulk file: {(bulk.log || []).slice(-1)[0] || "starting…"}</div>}
+              {bulk && !bulk.running && bulk.last && bulk.last.ok === false && <div className="tx-note warn">Bulk load failed: {bulk.last.error || bulk.last.summary}</div>}
+              {!job?.running && !bulk?.running && incomplete.length > 0 && (
+                <div style={{ marginTop: 10, display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
+                  <button className="fec-btn" onClick={startBulk} title="Streams the FEC’s nationwide individual-contributions file for these periods and keeps the Tennessee rows">Get every donor from the FEC bulk file</button>
+                  {remaining > 0 && <button className="fec-btn ghost" onClick={() => startPull(true)}>or pull {fmtNum(remaining)} rows through the API</button>}
+                  <span className="sub">The bulk file takes minutes and also loads every Tennessee resident’s federal giving. The API route is about {fmtNum(Math.ceil(remaining / 100))} requests at 1,000 an hour.</span>
                 </div>
               )}
               <div className="tx-note">
                 Itemized gifts only: federal donors appear once they pass $200 in a cycle, so small-dollar money is in the candidate’s totals but not here.
+                {data.mergedRecords > 0 && ` ${fmtNum(data.mergedRecords)} records were merged as the same donor written differently (same name once titles are dropped, or same first and last name at the same ZIP).`}
                 {data.conduits.count > 0 && ` ${data.conduits.names.join(" / ")} pass-through lines (${fmtUSD(data.conduits.total)}) are left out — that money is listed under the people who gave it.`}
-                {" "}Transfers from joint fundraising committees show as one line each; the people behind them are itemized on those committees’ own reports. Leadership PACs are separate committees and are not included.
+                {data.transfersDropped > 0 && ` ${fmtUSD(data.transfersDropped)} in transfers between the selected committees is left out so it isn’t counted twice.`}
               </div>
             </div>
           )}
 
-          <div className="fec-status">
-            <span style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
-              <input value={filter} onChange={(e) => setFilter(e.target.value)} placeholder="Filter by name, employer, city…" aria-label="Filter donors"
-                style={{ background: "var(--panel)", color: "var(--bone)", border: "1px solid var(--line)", padding: "6px 10px", fontSize: 13, width: 260 }} />
-              <div className="tx-seg" role="group" aria-label="Source">
-                {[["all", "All"], ["federal", "Federal"], ["state", "State"], ["both", "Both"]].map(([v, l]) => <button key={v} aria-pressed={src === v} onClick={() => setSrc(v)}>{l}</button>)}
+          {view === "donors" && (
+            <>
+              <div className="fec-status">
+                <span style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
+                  <input value={filter} onChange={(e) => setFilter(e.target.value)} placeholder="Filter by name, employer, city, ZIP…" aria-label="Filter donors"
+                    style={{ background: "var(--panel)", color: "var(--bone)", border: "1px solid var(--line)", padding: "6px 10px", fontSize: 13, width: 260 }} />
+                  <div className="tx-seg" role="group" aria-label="Source">
+                    {[["all", "All"], ["federal", "Federal"], ["state", "State"], ["both", "Both"]].map(([v, l]) => <button key={v} aria-pressed={src === v} onClick={() => setSrc(v)}>{l}</button>)}
+                  </div>
+                  <div className="tx-seg" role="group" aria-label="Donor kind">
+                    {[["all", "Everyone"], ["people", "People"], ["orgs", "Committees and businesses"]].map(([v, l]) => <button key={v} aria-pressed={who === v} onClick={() => setWho(v)}>{l}</button>)}
+                  </div>
+                  <span>{fmtNum(rows.length)} donor{rows.length === 1 ? "" : "s"}</span>
+                </span>
+                <button className="fec-btn ghost" onClick={exportCsv} disabled={!rows.length}>Export CSV ({fmtNum(rows.length)})</button>
               </div>
-              <div className="tx-seg" role="group" aria-label="Donor kind">
-                {[["all", "Everyone"], ["people", "People"], ["orgs", "Committees and businesses"]].map(([v, l]) => <button key={v} aria-pressed={who === v} onClick={() => setWho(v)}>{l}</button>)}
-              </div>
-              <span>{fmtNum(rows.length)} donor{rows.length === 1 ? "" : "s"}</span>
-            </span>
-            <button className="fec-btn ghost" onClick={exportCsv} disabled={!rows.length}>Export CSV ({fmtNum(rows.length)})</button>
-          </div>
-          {rows.length === 0 && <div className="fec-empty">{data.donors.length ? "No donor matches that filter." : job?.running ? "Rows are on their way from the FEC…" : "No itemized donors found for the selected accounts."}</div>}
-          {rows.length > 0 && (
-            <div className="tx-panel" style={{ padding: 0, overflow: "hidden" }}>
-              <div className="fec-table-wrap">
-                <table className="fec-table">
-                  <thead><tr><th>Donor</th><th>Location</th><th>Employer / occupation</th><th className="amt">Federal</th><th className="amt">State</th><th className="amt">Total</th><th className="amt">Gifts</th><th>Last gift</th></tr></thead>
-                  <tbody>
-                    {rows.slice(page * PER, (page + 1) * PER).map((d) => (
-                      <tr key={d.key}>
-                        <td><button className="tx-linkbtn" style={{ color: "var(--bone)", fontWeight: 600 }} onClick={() => onOpenDonor?.(d.name)}
-                          title="Open this donor’s full giving history on the Donors tab">{d.name}</button>
-                          {d.type && !/^IND$/i.test(d.type) && <span className="fec-badge">{d.type}</span>}</td>
-                        <td>{[d.city, d.st].filter(Boolean).join(", ") || "—"}</td>
-                        <td>{d.employer || "—"}{d.occupation ? <div className="sub">{d.occupation}</div> : null}</td>
-                        <td className="amt" style={d.federal ? undefined : { color: "var(--muted)" }}>{d.federal ? fmtUSD(d.federal) : "—"}</td>
-                        <td className="amt" style={d.stateAmt ? undefined : { color: "var(--muted)" }}>{d.stateAmt ? fmtUSD(d.stateAmt) : "—"}</td>
-                        <td className="amt"><b>{fmtUSD(d.total)}</b></td>
-                        <td className="amt" style={{ color: "var(--bone)" }}>{d.count}</td>
-                        <td className="sub" style={{ whiteSpace: "nowrap" }}>{d.lastDate || "—"}</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            </div>
-          )}
-          {rows.length > PER && (
-            <div className="fec-pager">
-              <button onClick={() => setPage((p) => Math.max(0, p - 1))} disabled={page === 0}>◂ Prev</button>
-              <span className="fec-tag">page {page + 1} / {Math.ceil(rows.length / PER)}</span>
-              <button onClick={() => setPage((p) => p + 1)} disabled={(page + 1) * PER >= rows.length}>Next ▸</button>
-            </div>
+              {rows.length === 0 && <div className="fec-empty">{data.donors.length ? "No donor matches that filter." : job?.running ? "Rows are on their way from the FEC…" : "No itemized donors found for the selected accounts."}</div>}
+              {rows.length > 0 && (
+                <div className="tx-panel" style={{ padding: 0, overflow: "hidden" }}>
+                  <div className="fec-table-wrap">
+                    <table className="fec-table">
+                      <thead><tr><th>Donor</th><th>Location</th><th>Employer / occupation</th><th className="amt">Federal</th><th className="amt">State</th><th className="amt">Total</th><th className="amt">Gifts</th><th>Last gift</th></tr></thead>
+                      <tbody>
+                        {rows.slice(page * PER, (page + 1) * PER).map((d) => (
+                          <tr key={d.key}>
+                            <td><button className="tx-linkbtn" style={{ color: "var(--bone)", fontWeight: 600 }} onClick={() => onOpenDonor?.(d.name)}
+                              title="Open this donor’s full giving history on the Donors tab">{d.name}</button>
+                              {d.type && !/^IND$/i.test(d.type) && <span className="fec-badge">{d.type}</span>}
+                              {d.variants > 1 && <div className="sub" title={(d.names || []).join("\n")}>also written {d.variants - 1} other way{d.variants > 2 ? "s" : ""}</div>}</td>
+                            <td>{[d.city, d.st].filter(Boolean).join(", ") || "—"}{d.zip ? <span className="sub"> {d.zip}</span> : null}</td>
+                            <td>{d.employer || "—"}{d.occupation ? <div className="sub">{d.occupation}</div> : null}</td>
+                            <td className="amt" style={d.federal ? undefined : { color: "var(--muted)" }}>{d.federal ? fmtUSD(d.federal) : "—"}</td>
+                            <td className="amt" style={d.stateAmt ? undefined : { color: "var(--muted)" }}>{d.stateAmt ? fmtUSD(d.stateAmt) : "—"}</td>
+                            <td className="amt"><b>{fmtUSD(d.total)}</b></td>
+                            <td className="amt" style={{ color: "var(--bone)" }}>{d.count}</td>
+                            <td className="sub" style={{ whiteSpace: "nowrap" }}>{d.lastDate || "—"}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              )}
+              {rows.length > PER && (
+                <div className="fec-pager">
+                  <button onClick={() => setPage((p) => Math.max(0, p - 1))} disabled={page === 0}>◂ Prev</button>
+                  <span className="fec-tag">page {page + 1} / {Math.ceil(rows.length / PER)}</span>
+                  <button onClick={() => setPage((p) => p + 1)} disabled={(page + 1) * PER >= rows.length}>Next ▸</button>
+                </div>
+              )}
+            </>
           )}
         </>
+      )}
+    </>
+  );
+}
+
+// =============================================================================================
+//  By place — who gives from a ZIP, county or city, and to whom
+// =============================================================================================
+function ByPlace({ meta, onOpenDonor }) {
+  const [mode, setMode] = useState("zip");
+  const [zip, setZip] = useState(""); const [county, setCounty] = useState(""); const [city, setCity] = useState("");
+  const [d, setD] = useState(null); const [err, setErr] = useState(null); const [loading, setLoading] = useState(false);
+  const counties = Object.entries(meta?.counties || {}).sort((a, b) => a[1].localeCompare(b[1]));
+  const run = async () => {
+    const qs = mode === "zip" ? { zip } : mode === "county" ? { county } : { city };
+    if (!Object.values(qs)[0]) return;
+    setLoading(true); setErr(null);
+    try { setD(await getJSON(`/api/tn/place?${qsOf(qs)}`)); } catch (e) { setErr(e.message); setD(null); } finally { setLoading(false); }
+  };
+  const src = (s) => (s === "tn" ? "state" : "federal");
+  return (
+    <>
+      <p className="tx-lede">Turn the question around: pick a <b>place</b> and see who there gives, and which candidates and committees they give to — state and federal together.</p>
+      <div className="tx-panel">
+        <div style={{ display: "flex", gap: 10, alignItems: "end", flexWrap: "wrap" }}>
+          <div className="tx-seg" role="group" aria-label="Place type">
+            {[["zip", "ZIP code"], ["county", "County"], ["city", "City"]].map(([v, l]) => <button key={v} aria-pressed={mode === v} onClick={() => setMode(v)}>{l}</button>)}
+          </div>
+          <div className="fec-field" style={{ minWidth: 220 }}>
+            {mode === "zip" && <input value={zip} onChange={(e) => setZip(e.target.value.replace(/\D/g, "").slice(0, 5))} onKeyDown={(e) => e.key === "Enter" && run()} placeholder="5-digit ZIP" inputMode="numeric" aria-label="ZIP code" />}
+            {mode === "county" && <select value={county} onChange={(e) => setCounty(e.target.value)} aria-label="County"><option value="">Choose a county</option>{counties.map(([f, n]) => <option key={f} value={f}>{n}</option>)}</select>}
+            {mode === "city" && <input value={city} onChange={(e) => setCity(e.target.value)} onKeyDown={(e) => e.key === "Enter" && run()} placeholder="City name" aria-label="City" />}
+          </div>
+          <button className="fec-btn" onClick={run} disabled={loading}>{loading ? "Looking…" : "Show giving"}</button>
+        </div>
+      </div>
+      {err && <div className="fec-error" role="alert">{err}</div>}
+      {d && (
+        <>
+          <div className="tx-kpis">
+            <div className="tx-kpi"><span>{d.label}{d.county ? ` · ${d.county.name} County` : ""}</span><b>{fmtUSD(d.totals.total)}</b><small>{fmtNum(d.totals.count)} gifts stored</small></div>
+            <div className="tx-kpi"><span>Donors</span><b>{fmtNum(d.totals.donors)}</b></div>
+            <div className="tx-kpi"><span>Recipients</span><b>{fmtNum(d.totals.recipients)}</b></div>
+            {d.bySource.map((s) => <div className="tx-kpi" key={s.source}><span>{s.source === "tn" ? "To state campaigns" : "To federal committees"}</span><b>{fmtUSDshort(s.total)}</b><small>{fmtNum(s.count)} gifts</small></div>)}
+          </div>
+          {d.totals.count === 0 && <div className="fec-empty">Nothing stored for {d.label} yet. Federal giving by Tennessee residents arrives with the bulk load (Admin → Load bulk data, “TN individual donors”); state giving arrives as accounts are opened.</div>}
+          {d.totals.count > 0 && (
+            <div className="tx-cols">
+              <Rank title="Who gives" items={d.donors.slice(0, 40).map((x) => ({ name: x.name, total: x.total, count: x.count }))} onPick={(it) => onOpenDonor?.(it.name)} />
+              <Rank title="Who receives" items={d.recipients.slice(0, 40).map((x) => ({ name: `${x.name || x.recipientId} · ${src(x.source)}`, total: x.total, count: x.donors }))} color="var(--olive)" />
+            </div>
+          )}
+          <div className="tx-note">{d.note}</div>
+        </>
+      )}
+    </>
+  );
+}
+
+// =============================================================================================
+//  State outside spending — independent expenditures by race
+// =============================================================================================
+function OutsideSpending() {
+  const nowY = new Date().getFullYear();
+  const [year, setYear] = useState(String(nowY));
+  const [d, setD] = useState(null); const [err, setErr] = useState(null); const [open, setOpen] = useState({});
+  useEffect(() => { let live = true; setD(null); setErr(null); setOpen({}); getJSON(`/api/tn/ie?year=${year}`).then((x) => live && setD(x)).catch((e) => live && setErr(e.message)); return () => { live = false; }; }, [year]);
+  const max = Math.max(...(d?.races || []).map((r) => r.support + r.oppose), 1);
+  return (
+    <>
+      <p className="tx-lede">Independent expenditures reported to the state: money spent <b>for or against</b> a Tennessee candidate by PACs and others, outside the candidate’s own campaign.</p>
+      <div className="fec-status">
+        <select className="fec-modelsel" value={year} onChange={(e) => setYear(e.target.value)} aria-label="Report year" style={{ fontSize: 14, padding: "6px 8px" }}>
+          {Array.from({ length: 10 }, (_, i) => String(nowY - i)).map((y) => <option key={y} value={y}>Report year {y}</option>)}
+        </select>
+        {d && <span>{fmtUSD(d.total)} across {fmtNum(d.count)} expenditures · {fmtNum(d.races.length)} candidates targeted</span>}
+      </div>
+      {err && <div className="fec-error" role="alert">{err}</div>}
+      {!d && !err && <div className="fec-empty"><span className="fec-spin">Reading independent expenditures from TREF</span></div>}
+      {d?.truncated && <div className="fec-error" role="status">{d.note || "TREF cut this search off at 500 rows; totals are incomplete."}</div>}
+      {d && d.count === 0 && <div className="fec-empty">No independent expenditures reported for {d.year}.</div>}
+      {d && d.count > 0 && (
+        <div className="tx-cols" style={{ gridTemplateColumns: "minmax(0, 2fr) minmax(260px, 1fr)" }}>
+          <div className="tx-panel">
+            <h3>By candidate</h3>
+            <div className="fec-legend" style={{ marginTop: 0, marginBottom: 8 }}><span><span className="fec-sw" style={{ background: "var(--olive)" }} /> supporting</span><span><span className="fec-sw" style={{ background: "var(--rose)" }} /> opposing</span></div>
+            {d.races.slice(0, 80).map((r) => (
+              <div key={r.candidate} style={{ padding: "8px 0", borderBottom: "1px solid var(--line-soft)" }}>
+                <div style={{ display: "flex", justifyContent: "space-between", gap: 10, fontSize: 13 }}>
+                  <button className="tx-linkbtn" style={{ color: "var(--bone)", fontWeight: 600 }} onClick={() => setOpen((p) => ({ ...p, [r.candidate]: !p[r.candidate] }))}>{r.candidate} {open[r.candidate] ? "▾" : "▸"}</button>
+                  <span style={{ fontFamily: "var(--font-num)", whiteSpace: "nowrap" }}>{r.support > 0 && <span style={{ color: "var(--olive)" }}>{fmtUSDshort(r.support)} for</span>}{r.support > 0 && r.oppose > 0 && " · "}{r.oppose > 0 && <span style={{ color: "var(--rose)" }}>{fmtUSDshort(r.oppose)} against</span>}</span>
+                </div>
+                <div style={{ display: "flex", height: 6, background: "var(--ink)", borderRadius: 3, overflow: "hidden", marginTop: 5 }}>
+                  <i style={{ width: `${(r.support / max) * 100}%`, background: "var(--olive)" }} /><i style={{ width: `${(r.oppose / max) * 100}%`, background: "var(--rose)" }} />
+                </div>
+                {open[r.candidate] && (
+                  <div style={{ marginTop: 8, fontSize: 12 }}>
+                    {r.spenders.map((s, i) => <div key={i} className="sub">{s.name} — {s.side === "oppose" ? "against" : "for"} — {fmtUSD(s.total)}</div>)}
+                    <div className="fec-table-wrap" style={{ marginTop: 6 }}>
+                      <table className="fec-table"><tbody>{r.items.slice(0, 15).map((it, i) => (
+                        <tr key={i}><td className="sub">{it.date}</td><td>{it.by}</td><td className="sub">{it.vendor}{it.purpose ? ` · ${it.purpose}` : ""}</td><td className="amt" style={{ color: it.side === "oppose" ? "var(--rose)" : "var(--olive)" }}>{fmtUSD(it.amount)}</td></tr>
+                      ))}</tbody></table>
+                    </div>
+                  </div>
+                )}
+              </div>
+            ))}
+          </div>
+          <Rank title="Biggest outside spenders" items={d.spenders} />
+        </div>
+      )}
+    </>
+  );
+}
+
+function AutoCheck() {
+  const [a, setA] = useState(null); const [msg, setMsg] = useState(null);
+  const load = () => getJSON("/api/tn/auto").then(setA).catch(() => {});
+  useEffect(() => { load(); }, []);
+  if (!a) return null;
+  const save = async (patch) => { const next = { ...a, ...patch }; setA(next); try { await post("/api/tn/auto", next); setMsg("Saved"); setTimeout(() => setMsg(null), 2000); load(); } catch (e) { setMsg(e.message); } };
+  const runNow = async () => { try { await post("/api/tn/auto/run", {}); setMsg("Started — new alerts show under the bell when it finishes."); setTimeout(load, 4000); } catch (e) { setMsg(e.message); } };
+  return (
+    <div className="tx-panel">
+      <h3>Automatic check</h3>
+      <div style={{ display: "flex", gap: 14, alignItems: "center", flexWrap: "wrap", fontSize: 13 }}>
+        <label className="fec-check"><input type="checkbox" checked={a.enabled} onChange={(e) => save({ enabled: e.target.checked })} /> Check Tennessee every</label>
+        <select className="fec-modelsel" value={a.everyHours} onChange={(e) => save({ everyHours: Number(e.target.value) })} aria-label="Interval">
+          {[12, 24, 48, 168].map((h) => <option key={h} value={h}>{h === 168 ? "week" : `${h} hours`}</option>)}
+        </select>
+        <label className="fec-check" style={{ gap: 5 }}>alert on gifts of
+          <select className="fec-modelsel" value={a.giftThreshold} onChange={(e) => save({ giftThreshold: Number(e.target.value) })} aria-label="Gift threshold">
+            {[1000, 2500, 5000, 10000, 25000].map((v) => <option key={v} value={v}>{fmtUSD(v)}+</option>)}
+          </select>
+        </label>
+        <button className="fec-btn ghost" onClick={runNow} disabled={a.running}>{a.running ? "Checking…" : "Check now"}</button>
+        {msg && <span className="sub">{msg}</span>}
+      </div>
+      <div className="tx-note">
+        Each check re-syncs the current cycles, then looks at the {a.tracked} entit{a.tracked === 1 ? "y" : "ies"} you track in the Registry (★).
+        New registrations, new filings and large gifts appear under the bell.
+        {a.last ? ` Last check ${timeAgo(a.last.at)}${a.last.ok === false ? ` failed: ${a.last.error}` : ` — ${a.last.added} new alert${a.last.added === 1 ? "" : "s"}`}.` : " Not run yet."}
+        {a.enabled && a.nextAt ? ` Next around ${new Date(a.nextAt).toLocaleString("en-US", { weekday: "short", hour: "numeric", minute: "2-digit" })}.` : ""}
+      </div>
+    </div>
+  );
+}
+
+// =============================================================================================
+//  Lobbying — Ethics Commission roster: who employs lobbyists, and who lobbies for whom
+// =============================================================================================
+function Lobbying() {
+  const [q, setQ] = useState(""); const [d, setD] = useState(null); const [err, setErr] = useState(null);
+  const [detail, setDetail] = useState(null); // { kind, id, name, data | error }
+  useEffect(() => {
+    let live = true;
+    const t = setTimeout(() => { getJSON(`/api/tn/lobby?${qsOf({ q })}`).then((x) => live && setD(x)).catch((e) => live && setErr(e.message)); }, d ? 200 : 0);
+    return () => { live = false; clearTimeout(t); };
+    // eslint-disable-next-line
+  }, [q]);
+  const open = async (kind, id, name) => {
+    setDetail({ kind, id, name });
+    try { const data = await getJSON(`/api/tn/lobby/${kind}/${id}`); setDetail({ kind, id, name, data }); }
+    catch (e) { setDetail({ kind, id, name, error: e.message }); }
+  };
+  const other = detail?.kind === "employer" ? "lobbyist" : "employer";
+  return (
+    <>
+      <p className="tx-lede">
+        The Tennessee Ethics Commission’s lobbying roster: every organization that pays lobbyists at the state capitol and every registered lobbyist.
+        Open one to see <b>who lobbies for whom</b>, year by year.
+      </p>
+      <div className="tx-panel">
+        <div style={{ display: "flex", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
+          <input value={q} onChange={(e) => setQ(e.target.value)} placeholder="Employer, lobbyist or city" aria-label="Search the lobbying roster"
+            style={{ flex: 1, minWidth: 240, maxWidth: 480, background: "var(--ink)", color: "var(--bone)", border: "1px solid var(--line)", padding: "8px 12px", fontSize: 14 }} />
+          {d && <span className="sub">{fmtNum(d.totals.employers)} employers · {fmtNum(d.totals.lobbyists)} lobbyists{d.year ? ` · ${d.year} roster` : ""}{d.syncedAt ? ` · read ${timeAgo(d.syncedAt)}` : ""}</span>}
+        </div>
+        {d?.note && <div className="tx-note warn">{d.note}</div>}
+      </div>
+      {err && <div className="fec-error" role="alert">{err}</div>}
+      {!d && !err && <div className="fec-empty"><span className="fec-spin">Reading the roster from the Ethics Commission</span></div>}
+      {detail && (
+        <div className="tx-panel" style={{ borderTop: "3px solid var(--brass)" }}>
+          <div style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "baseline", flexWrap: "wrap" }}>
+            <h3 style={{ margin: 0 }}>{detail.name} <span className="sub" style={{ fontFamily: "var(--font-ui)", fontWeight: 400 }}>· {detail.kind === "employer" ? "employer of lobbyists" : "lobbyist"}</span></h3>
+            <span style={{ display: "flex", gap: 10, alignItems: "center" }}>
+              {detail.data?.url && <a className="fec-extlink" href={detail.data.url} target="_blank" rel="noopener noreferrer">Ethics Commission record ↗</a>}
+              <button className="fec-btn ghost sm" onClick={() => setDetail(null)}>Close</button>
+            </span>
+          </div>
+          {detail.error && <div className="fec-error">{detail.error}</div>}
+          {!detail.data && !detail.error && <span className="fec-spin">Loading</span>}
+          {detail.data && (
+            <>
+              {detail.data.contact && <div className="sub" style={{ marginTop: 4 }}>{detail.data.contact}</div>}
+              {detail.data.years.length === 0 && <div className="tx-note">No registrations listed.</div>}
+              {detail.data.years.slice(0, 6).map((y, i) => (
+                <div key={`${y.year}-${i}`} style={{ marginTop: 10 }}>
+                  <div style={{ fontWeight: 600, fontSize: 13 }}>{y.year || "Registrations"} <span className="sub">· {y.items.length} {detail.kind === "employer" ? "lobbyist" : "client"}{y.items.length === 1 ? "" : "s"}</span></div>
+                  <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginTop: 5 }}>
+                    {y.items.map((it) => <button key={`${it.id}-${it.registered}`} className="fec-chip" onClick={() => open(other, it.id, it.name)} title={it.registered ? `registered ${it.registered}` : undefined}>{it.name}</button>)}
+                  </div>
+                </div>
+              ))}
+              {detail.data.years.length > 6 && <div className="tx-note">Earlier years are on the Ethics Commission record.</div>}
+            </>
+          )}
+        </div>
+      )}
+      {d && (
+        <div className="tx-cols">
+          <div className="tx-panel" style={{ padding: 0, overflow: "hidden" }}>
+            <h3 className="tx-h" style={{ padding: "12px 16px 0" }}>Employers of lobbyists</h3>
+            <div className="fec-table-wrap" style={{ maxHeight: 560, overflowY: "auto" }}>
+              <table className="fec-table"><tbody>
+                {d.employers.map((e) => <tr key={e.id}><td><button className="tx-linkbtn" style={{ color: "var(--bone)" }} onClick={() => open("employer", e.id, e.name)}>{e.name}</button></td><td className="sub">{[e.city, e.state].filter(Boolean).join(", ")}</td></tr>)}
+              </tbody></table>
+            </div>
+            {d.totals.employers > d.employers.length && <div className="tx-note" style={{ padding: "0 16px 12px" }}>Showing the first {d.employers.length} — type to narrow.</div>}
+          </div>
+          <div className="tx-panel" style={{ padding: 0, overflow: "hidden" }}>
+            <h3 className="tx-h" style={{ padding: "12px 16px 0" }}>Lobbyists</h3>
+            <div className="fec-table-wrap" style={{ maxHeight: 560, overflowY: "auto" }}>
+              <table className="fec-table"><tbody>
+                {d.lobbyists.map((l) => <tr key={l.id}><td><button className="tx-linkbtn" style={{ color: "var(--bone)" }} onClick={() => open("lobbyist", l.id, l.name)}>{l.name}</button></td><td className="sub">{[l.city, l.state].filter(Boolean).join(", ")}</td></tr>)}
+              </tbody></table>
+            </div>
+            {d.totals.lobbyists > d.lobbyists.length && <div className="tx-note" style={{ padding: "0 16px 12px" }}>Showing the first {d.lobbyists.length} — type to narrow.</div>}
+          </div>
+        </div>
+      )}
+    </>
+  );
+}
+
+// =============================================================================================
+//  Legislature — members, committees, sponsored bills
+// =============================================================================================
+function LegislatorCard({ chamber, district, onCandidate, compact }) {
+  const [m, setM] = useState(null); const [err, setErr] = useState(null); const [showBills, setShowBills] = useState(false);
+  useEffect(() => { let live = true; setM(null); setErr(null); getJSON(`/api/tn/legislature/member?${qsOf({ chamber, district })}`).then((x) => live && setM(x)).catch((e) => live && setErr(e.message)); return () => { live = false; }; }, [chamber, district]);
+  if (err) return compact ? null : <div className="fec-error">{err}</div>;
+  if (!m) return <div className="tx-panel"><span className="fec-spin">Loading the member’s record</span></div>;
+  const pc = m.party === "R" ? "#B85B5B" : m.party === "D" ? "#5B82B8" : "var(--muted)";
+  return (
+    <div className="tx-panel" style={{ borderLeft: `4px solid ${pc}` }}>
+      <div style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: "baseline", flexWrap: "wrap" }}>
+        <h3 style={{ margin: 0 }}>{m.chamber === "S" ? "Sen." : "Rep."} {m.name} <span className="sub" style={{ fontFamily: "var(--font-ui)", fontWeight: 400 }}>· {m.party === "R" ? "Republican" : m.party === "D" ? "Democrat" : m.party} · {m.chamber === "S" ? "Senate" : "House"} district {m.district}</span></h3>
+        <span style={{ display: "flex", gap: 10, alignItems: "center" }}>
+          {onCandidate && <button className="fec-btn ghost sm" onClick={() => onCandidate(m.name.split(",")[0])}>Donors ▸</button>}
+          <a className="fec-extlink" href={m.memberUrl} target="_blank" rel="noopener noreferrer">capitol.tn.gov ↗</a>
+        </span>
+      </div>
+      {m.area && <div className="sub" style={{ marginTop: 2 }}>{m.area}</div>}
+      {m.committees.length > 0 ? (
+        <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginTop: 8 }}>
+          {m.committees.map((c) => <span key={c} className={`tx-pill${/^(chair|chairman)/i.test(c) ? " win" : ""}`}>{c}</span>)}
+        </div>
+      ) : <div className="tx-note">No committee assignments posted yet.</div>}
+      <div style={{ marginTop: 8, fontSize: 13 }}>
+        {m.billCount > 0
+          ? <button className="tx-linkbtn" onClick={() => setShowBills((v) => !v)}>{m.billCount} sponsored bill{m.billCount === 1 ? "" : "s"} in the {m.billsGa}th General Assembly {showBills ? "▾" : "▸"}</button>
+          : <span className="sub">No sponsored bills listed.</span>}
+      </div>
+      {showBills && (
+        <div className="fec-table-wrap" style={{ marginTop: 6, maxHeight: 360, overflowY: "auto" }}>
+          <table className="fec-table"><tbody>
+            {m.bills.map((b) => <tr key={b.number}><td style={{ whiteSpace: "nowrap" }}>{b.url ? <a className="fec-extlink" href={b.url} target="_blank" rel="noopener noreferrer">{b.number}</a> : b.number}</td><td>{b.abstract}</td><td className="sub">{b.lastAction}<div>{b.date}</div></td></tr>)}
+          </tbody></table>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function Legislature({ onCandidate }) {
+  const [d, setD] = useState(null); const [err, setErr] = useState(null);
+  const [f, setF] = useState(""); const [chamber, setChamber] = useState(""); const [pick, setPick] = useState(null);
+  useEffect(() => { getJSON("/api/tn/legislature").then(setD).catch((e) => setErr(e.message)); }, []);
+  const rows = (d?.members || []).filter((m) => (!chamber || m.chamber === chamber) && (!f || `${m.name} ${m.district}`.toUpperCase().includes(f.toUpperCase())));
+  return (
+    <>
+      <p className="tx-lede">The sitting General Assembly. Pick a member to see their <b>committee seats and sponsored bills</b>, then jump to who funds them.</p>
+      <div className="tx-panel">
+        <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
+          <input value={f} onChange={(e) => setF(e.target.value)} placeholder="Name or district" aria-label="Filter members"
+            style={{ background: "var(--ink)", color: "var(--bone)", border: "1px solid var(--line)", padding: "8px 12px", fontSize: 14, width: 260 }} />
+          <div className="tx-seg" role="group" aria-label="Chamber">
+            {[["", "Both chambers"], ["S", "Senate"], ["H", "House"]].map(([v, l]) => <button key={v || "all"} aria-pressed={chamber === v} onClick={() => setChamber(v)}>{l}</button>)}
+          </div>
+          {d && <span className="sub">{rows.length} member{rows.length === 1 ? "" : "s"}{d.syncedAt ? ` · roster read ${timeAgo(d.syncedAt)}` : ""}</span>}
+        </div>
+        {d?.note && <div className="tx-note warn">{d.note}</div>}
+      </div>
+      {err && <div className="fec-error" role="alert">{err}</div>}
+      {!d && !err && <div className="fec-empty"><span className="fec-spin">Reading the member directory</span></div>}
+      {pick && <LegislatorCard key={`${pick.chamber}${pick.district}`} chamber={pick.chamber} district={pick.district} onCandidate={onCandidate} />}
+      {d && (
+        <div className="tx-panel" style={{ padding: 0, overflow: "hidden" }}>
+          <div className="fec-table-wrap">
+            <table className="fec-table">
+              <thead><tr><th>Member</th><th>Chamber</th><th>District</th><th>Party</th><th aria-label="Actions" /></tr></thead>
+              <tbody>
+                {rows.map((m) => (
+                  <tr key={`${m.chamber}${m.district}`}>
+                    <td><button className="tx-linkbtn" style={{ color: "var(--bone)", fontWeight: 600 }} onClick={() => { setPick(m); window.scrollTo({ top: 0, behavior: "smooth" }); }}>{m.name}</button></td>
+                    <td>{m.chamber === "S" ? "Senate" : "House"}</td><td>{m.district}</td>
+                    <td><PartyPill party={m.party === "R" ? "Republican" : m.party === "D" ? "Democrat" : m.party} /></td>
+                    <td style={{ textAlign: "right" }}><button className="fec-btn ghost sm" onClick={() => onCandidate(m.name.split(",")[0])}>Donors ▸</button></td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
       )}
     </>
   );
@@ -1135,6 +1659,7 @@ function CandidateDonors({ onOpenDonor }) {
 // =============================================================================================
 export default function TennesseeHub({ registry, seed, onOpenEntity, onOpenRace, onOpenDonor }) {
   const [section, setSection] = useState("candidate");
+  const [candSeed, setCandSeed] = useState(null); // { name, t } — another section asking for a candidate page
   const [visited, setVisited] = useState({ registry: true, candidate: true });
   const meta = useMeta();
   const go = (s) => { setSection(s); setVisited((v) => (v[s] ? v : { ...v, [s]: true })); };
@@ -1150,11 +1675,15 @@ export default function TennesseeHub({ registry, seed, onOpenEntity, onOpenRace,
         ))}
       </div>
       {/* sections stay mounted once opened so a search isn't lost when you look at another one */}
-      <div style={show("candidate")}><CandidateDonors onOpenDonor={onOpenDonor} /></div>
+      <div style={show("candidate")}><CandidateDonors onOpenDonor={onOpenDonor} seed={candSeed} /></div>
       <div style={show("registry")}>{registry}</div>
       {visited.directory && <div style={show("directory")}><Directory meta={meta} onOpenEntity={open} /></div>}
       {visited.money && <div style={show("money")}><MoneySearch meta={meta} onOpenEntity={open} /></div>}
       {visited.filings && <div style={show("filings")}><Filings meta={meta} onOpenEntity={open} /></div>}
+      {visited.outside && <div style={show("outside")}><OutsideSpending /></div>}
+      {visited.place && <div style={show("place")}><ByPlace meta={meta} onOpenDonor={onOpenDonor} /></div>}
+      {visited.lobby && <div style={show("lobby")}><Lobbying /></div>}
+      {visited.leg && <div style={show("leg")}><Legislature onCandidate={(name) => { setCandSeed({ name, t: Date.now() }); go("candidate"); }} /></div>}
       {visited.races && <div style={show("races")}><FederalRaces onOpenRace={onOpenRace} /></div>}
       {visited.dollars && <div style={show("dollars")}><FederalDollars meta={meta} /></div>}
     </>

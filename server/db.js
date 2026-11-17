@@ -226,6 +226,11 @@ try {
     ) WITHOUT ROWID;
   `);
 
+  // Contributor ZIP (5 digits). Added Nov 2026 for geography views and donor-identity matching;
+  // rows stored before that have NULL until they are re-pulled. The partial index stays small.
+  try { db.exec("ALTER TABLE contributions ADD COLUMN zip TEXT"); } catch { /* column already exists */ }
+  db.exec("CREATE INDEX IF NOT EXISTS idx_contrib_zip ON contributions(zip) WHERE zip IS NOT NULL");
+
   // Tennessee directory: every candidate/PAC row TREF has ever returned to this app, keyed by
   // (tn_id, election year). Lets the TN tab search names, treasurers, cities, ZIPs and districts
   // locally (substring, instant, zero calls to apps.tn.gov) once the directory has been synced.
@@ -600,8 +605,8 @@ export function contribUpsertMany(rows) {
     const stmt = db.prepare(`
       INSERT INTO contributions (source, sub_id, kind, donor_key, donor_name, employer, occupation,
         city, state, entity_type, recipient_id, recipient_name, candidate_id, cycle, date, amount,
-        memo, report, first_seen, fetched_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        memo, report, first_seen, fetched_at, zip)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(source, sub_id) DO UPDATE SET
         kind=excluded.kind, donor_key=excluded.donor_key,
         donor_name=COALESCE(excluded.donor_name, donor_name),
@@ -616,7 +621,8 @@ export function contribUpsertMany(rows) {
         cycle=COALESCE(excluded.cycle, cycle),
         date=CASE WHEN excluded.date != '' THEN excluded.date ELSE date END,
         amount=excluded.amount, memo=excluded.memo,
-        report=COALESCE(excluded.report, report), fetched_at=excluded.fetched_at
+        report=COALESCE(excluded.report, report), fetched_at=excluded.fetched_at,
+        zip=COALESCE(excluded.zip, zip)
     `); // first_seen deliberately NOT updated; sparse re-upserts must not blank out stored fields
     const nameStmt = db.prepare("INSERT OR IGNORE INTO donor_names (donor_key, donor_name) VALUES (?, ?)");
     let n = 0;
@@ -629,7 +635,8 @@ export function contribUpsertMany(rows) {
           r.donorName ?? null, r.employer ?? null, r.occupation ?? null, r.city ?? null,
           r.state ?? null, r.entityType ?? null, r.recipientId ?? null, r.recipientName ?? null,
           r.candidateId ?? null, r.cycle != null ? String(r.cycle) : null, r.date || "",
-          Number(r.amount) || 0, r.memo ? 1 : 0, r.report ?? null, now, now);
+          Number(r.amount) || 0, r.memo ? 1 : 0, r.report ?? null, now, now,
+          /^\d{5}/.test(String(r.zip || "")) ? String(r.zip).slice(0, 5) : null);
         n++;
       }
       db.exec("COMMIT");
@@ -1608,7 +1615,7 @@ export function contribRecipientDonorGroups(recipientIds, { cycles = [], source 
       if (v.source !== source || (v.kind || "contribution") !== "contribution" || v.memo) continue;
       if (!ids.includes(String(v.recipientId)) || (cys.length && !cys.includes(String(v.cycle)))) continue;
       const g = m.get(v.donorKey) || { donorKey: v.donorKey, name: v.donorName, employer: v.employer, occupation: v.occupation,
-        city: v.city, state: v.state, entityType: v.entityType, total: 0, count: 0, firstDate: null, lastDate: null };
+        city: v.city, state: v.state, entityType: v.entityType, zip: v.zip || null, total: 0, count: 0, firstDate: null, lastDate: null };
       g.total += Number(v.amount) || 0; g.count++;
       if (v.date) { if (!g.firstDate || v.date < g.firstDate) g.firstDate = v.date; if (!g.lastDate || v.date > g.lastDate) g.lastDate = v.date; }
       m.set(v.donorKey, g);
@@ -1622,7 +1629,7 @@ export function contribRecipientDonorGroups(recipientIds, { cycles = [], source 
       if (cys.length) { conds.push(`cycle IN (${cys.map(() => "?").join(",")})`); args.push(...cys); }
       return db.prepare(`
         SELECT donor_key AS donorKey, MAX(donor_name) AS name, MAX(employer) AS employer, MAX(occupation) AS occupation,
-               MAX(city) AS city, MAX(state) AS state, MAX(entity_type) AS entityType,
+               MAX(city) AS city, MAX(state) AS state, MAX(entity_type) AS entityType, MAX(zip) AS zip,
                SUM(amount) AS total, COUNT(*) AS count, MIN(NULLIF(date, '')) AS firstDate, MAX(date) AS lastDate
         FROM contributions WHERE ${conds.join(" AND ")}
         GROUP BY donor_key ORDER BY total DESC LIMIT ?`).all(...args, limit);
@@ -1648,3 +1655,84 @@ export function contribExistingCount(source, subIds) {
     return Number(db.prepare(`SELECT COUNT(*) AS n FROM contributions WHERE source = ? AND sub_id IN (${ids.map(() => "?").join(",")})`).get(String(source), ...ids)?.n || 0);
   } catch { return 0; }
 }
+
+// ---- place lookups (who gives from a ZIP / city, and to whom) ----
+// zips: array of 5-digit ZIPs (a county is passed as its ZIP list); city+state as the fallback for
+// rows stored before ZIPs were captured. Contributions only, memo rows excluded.
+export function contribPlace({ zips = [], city = "", state = "", limit = 100 } = {}) {
+  const empty = { totals: { total: 0, count: 0, donors: 0, recipients: 0 }, donors: [], recipients: [], bySource: [] };
+  const zl = (zips || []).map(String).filter((z) => /^\d{5}$/.test(z)).slice(0, 400);
+  if (!db || (!zl.length && !city)) return empty;
+  return memoized(`place:${zl.join(",")}|${city}|${state}|${limit}`, () => {
+    try {
+      const conds = ["kind = 'contribution'", "memo = 0"], args = [];
+      if (zl.length) { conds.push(`zip IN (${zl.map(() => "?").join(",")})`); args.push(...zl); }
+      else { conds.push("city = ? COLLATE NOCASE"); args.push(city); if (state) { conds.push("state = ? COLLATE NOCASE"); args.push(state); } }
+      db.exec(`CREATE TEMP TABLE IF NOT EXISTS place_hit (
+        donor_key TEXT, donor_name TEXT, employer TEXT, occupation TEXT, city TEXT, zip TEXT,
+        recipient_id TEXT, recipient_name TEXT, source TEXT, date TEXT, amount REAL);
+        DELETE FROM temp.place_hit;`);
+      db.prepare(`INSERT INTO temp.place_hit
+        SELECT donor_key, donor_name, employer, occupation, city, zip, recipient_id, recipient_name, source, date, amount
+        FROM contributions WHERE ${conds.join(" AND ")}`).run(...args);
+      const totals = db.prepare(`SELECT COALESCE(SUM(amount),0) AS total, COUNT(*) AS count,
+        COUNT(DISTINCT donor_key) AS donors, COUNT(DISTINCT recipient_id || source) AS recipients FROM temp.place_hit`).get();
+      const donors = db.prepare(`SELECT donor_key AS donorKey, MAX(donor_name) AS name, MAX(employer) AS employer, MAX(occupation) AS occupation,
+        MAX(city) AS city, MAX(zip) AS zip, SUM(amount) AS total, COUNT(*) AS count, COUNT(DISTINCT recipient_id || source) AS recipients, MAX(date) AS lastDate
+        FROM temp.place_hit GROUP BY donor_key ORDER BY total DESC LIMIT ?`).all(limit);
+      const recipients = db.prepare(`SELECT recipient_id AS recipientId, MAX(recipient_name) AS name, source, SUM(amount) AS total, COUNT(*) AS count,
+        COUNT(DISTINCT donor_key) AS donors, MAX(date) AS lastDate
+        FROM temp.place_hit GROUP BY recipient_id, source ORDER BY total DESC LIMIT ?`).all(limit);
+      const bySource = db.prepare("SELECT source, SUM(amount) AS total, COUNT(*) AS count FROM temp.place_hit GROUP BY source").all();
+      db.exec("DELETE FROM temp.place_hit");
+      return { totals, donors, recipients, bySource };
+    } catch (e) { console.warn("[contribPlace]", e.message); return empty; }
+  });
+}
+
+// Sibling donor_keys for identity merging: every stored key whose normalized name starts with the
+// same surname and contains the same first name (cheap pre-filter on the small donor_names table;
+// the caller applies the real matching rule).
+export function donorKeyCandidates(surname, first, limit = 200) {
+  if (!db || !surname) return [];
+  try {
+    return db.prepare(`SELECT DISTINCT donor_key AS donorKey, donor_name AS name FROM donor_names
+      WHERE donor_key LIKE ? AND donor_key LIKE ? LIMIT ?`).all(`${surname} %`, `%${first}%`, limit);
+  } catch { return []; }
+}
+// One location hint per donor key (latest non-null zip / state / employer).
+export function donorKeyFacts(keys) {
+  const ks = (keys || []).map(String).filter(Boolean).slice(0, 300);
+  if (!db || !ks.length) return [];
+  try {
+    return db.prepare(`SELECT donor_key AS donorKey, MAX(donor_name) AS name, MAX(zip) AS zip, MAX(state) AS state, MAX(employer) AS employer,
+      MAX(entity_type) AS entityType, SUM(CASE WHEN memo = 0 AND kind = 'contribution' THEN amount ELSE 0 END) AS total, COUNT(*) AS count
+      FROM contributions WHERE donor_key IN (${ks.map(() => "?").join(",")}) GROUP BY donor_key`).all(...ks);
+  } catch { return []; }
+}
+
+// Exact committee lookup by name (used to resolve "X VICTORY FUND" transfer lines to a committee id).
+export function fecCommitteeByName(name) {
+  if (!db || !name) return null;
+  try {
+    const r = db.prepare(`SELECT cmte_id AS cmteId, name, type, designation, state FROM fec_committee WHERE name = ? COLLATE NOCASE
+      ORDER BY last_cycle DESC LIMIT 1`).get(String(name).trim());
+    return r || null;
+  } catch { return null; }
+}
+export function fecCommitteesIn(state) {
+  if (!db) return [];
+  try { return db.prepare("SELECT cmte_id AS cmteId FROM fec_committee WHERE state = ?").all(String(state)).map((r) => r.cmteId); } catch { return []; }
+}
+
+// Directory rows first stored after `since` (new registrations seen by a sync).
+export function tnEntityNewSince(since, limit = 200) {
+  if (!db) return [];
+  try {
+    return db.prepare("SELECT * FROM tn_entity WHERE first_seen > ? ORDER BY first_seen DESC LIMIT ?").all(Number(since) || 0, limit).map(tnEntityOut);
+  } catch { return []; }
+}
+
+// Raw handle for feature modules that own their own tables (server/statehouse.js). null when
+// node:sqlite is unavailable — those modules then keep their data in memory only.
+export const rawDb = () => db;

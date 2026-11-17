@@ -8,8 +8,10 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import compression from "compression";
 import { searchCandidatesPacs, listReports, fetchReportDetail, searchMoney, tnHealth, TN_YEARS, TN_OFFICES, REPORT_PARSER_V } from "./tn.js";
 import { registerTnExplorer } from "./tnx.js";
+import { registerCandidate } from "./candidate.js";
+import { registerStatehouse } from "./statehouse.js";
 import { cacheGet, cacheSet, cacheGetWithAge, cacheGetStale, cacheCount, cacheFlush, settingGet, settingSet, persistent,
-         dbStorageStats, dbCompact, tnEntityUpsertMany,
+         dbStorageStats, dbCompact, tnEntityUpsertMany, tnEntityNewSince,
          tnReportListGet, tnReportListSave, tnReportDetailGet, tnReportDetailSave, tnReportCount,
          aiSummaryGet, aiSummarySave, aiSummaryCount, aiSummaryClear,
          tnSearchSave, tnSearchList,
@@ -236,7 +238,7 @@ function ingestScheduleA(results) {
         donorKey: normalizeDonorKey(r.contributor_name, r.contributor_state),
         donorName: r.contributor_name, employer: r.contributor_employer,
         occupation: r.contributor_occupation, city: r.contributor_city, state: r.contributor_state,
-        entityType: r.entity_type,
+        zip: r.contributor_zip, entityType: r.entity_type,
         recipientId: r.committee_id || r.committee?.committee_id, recipientName: r.committee?.name,
         cycle: r.two_year_transaction_period, date: normDate(r.contribution_receipt_date),
         amount: r.contribution_receipt_amount, memo: r.memo_code === "X",
@@ -2237,6 +2239,29 @@ async function moneySearch(args) {
   return p;
 }
 
+// TREF silently stops a contribution/expenditure search at 500 rows (verified Nov 2026). When a
+// search comes back with exactly 500, re-run it once per report type (16 disjoint slices) and
+// stitch the slices together. A slice that is itself 500 rows is still cut off — the result is
+// then flagged `truncated` so callers can say so instead of presenting a partial total as fact.
+const TN_REPORT_TYPE_IDS = Array.from({ length: 16 }, (_, i) => String(i + 1));
+const TN_CAP_NOTE = "TREF stops a search at 500 rows, and this one hit that limit even when split by report type — the figures here are incomplete. For one candidate or PAC, the report ledger (Money flows) and Candidate donors read the filed reports and are complete.";
+async function moneySearchAll(args) {
+  const base = await moneySearch(args);
+  if ((base.rows || []).length !== 500 || (args.reportTypes || []).length) return base;
+  const rows = [];
+  let truncated = false, failed = 0;
+  for (const rt of TN_REPORT_TYPE_IDS) {
+    try {
+      const part = await moneySearch({ ...args, reportTypes: [rt] });
+      if ((part.rows || []).length === 500) truncated = true;
+      rows.push(...(part.rows || []));
+    } catch { failed++; }
+  }
+  if (rows.length < 500) return { ...base, truncated: true, note: TN_CAP_NOTE }; // slices didn't cover it — keep the capped copy, flagged
+  truncated = truncated || failed > 0;
+  return { ...base, rows, count: rows.length, split: true, ...(truncated ? { truncated: true, note: TN_CAP_NOTE } : {}) };
+}
+
 // ---- cached wrappers around the TREF scrapers ----
 // Every caller (routes, activity scan, profile, dossier) goes through these so a given report list
 // or report detail is fetched from apps.tn.gov at most once, then served from cache/SQLite. This
@@ -2468,6 +2493,7 @@ function normalizeMoney(result, cap = 300) {
     count: result.count || rows.length,
     totalAmount,
     capped: rows.length > cap,
+    ...(result.truncated ? { truncated: true } : {}),
     ...(result.note ? { note: result.note } : {}),
   };
 }
@@ -2488,11 +2514,11 @@ app.get("/api/tn/money", async (req, res) => {
   const base = { electionYearId: electionYear, reportYear };
   const out = { source: "tn-tref", name, electionYear, reportYear };
   // three sequential searches (the polite chain spaces them out; ~15-20s total cold)
-  try { out.received = normalizeMoney(await moneySearch({ ...base, searchType: "contributions", recipientName: name })); }
+  try { out.received = normalizeMoney(await moneySearchAll({ ...base, searchType: "contributions", recipientName: name })); }
   catch (e) { out.receivedError = e.message; }
-  try { out.gave = normalizeMoney(await moneySearch({ ...base, searchType: "contributions", contributorName: name })); }
+  try { out.gave = normalizeMoney(await moneySearchAll({ ...base, searchType: "contributions", contributorName: name })); }
   catch (e) { out.gaveError = e.message; }
-  try { out.spent = normalizeMoney(await moneySearch({ ...base, searchType: "expenditures", candName: name })); }
+  try { out.spent = normalizeMoney(await moneySearchAll({ ...base, searchType: "expenditures", candName: name })); }
   catch (e) { out.spentError = e.message; }
 
   if (out.received || out.gave || out.spent) cacheSet(ck, out, TTL.tn);
@@ -2543,7 +2569,7 @@ app.get("/api/tn/donor", async (req, res) => {
         // years per cycle. The pairs are disjoint, so concatenation cannot duplicate rows.
         for (const ry of [labelYear, String(Number(labelYear) - 1)]) {
           try {
-            const r = normalizeMoney(await moneySearch({ searchType: "contributions", contributorName: name, electionYearId: cy.id, reportYear: ry }), 500);
+            const r = normalizeMoney(await moneySearchAll({ searchType: "contributions", contributorName: name, electionYearId: cy.id, reportYear: ry }), 500);
             if (!headers.length && r.headers?.length) headers = r.headers;
             if (r.rows?.length) rows.push(...r.rows);
             totalAmount += r.totalAmount || 0;
@@ -2574,7 +2600,7 @@ app.get("/api/tn/donor", async (req, res) => {
       return res.status(400).json({ error: { message: "electionYear (TREF id) and reportYear (YYYY) are required when a specific year is given." } });
     }
     const result = normalizeMoney(
-      await moneySearch({ searchType: "contributions", contributorName: name, electionYearId: electionYear, reportYear }),
+      await moneySearchAll({ searchType: "contributions", contributorName: name, electionYearId: electionYear, reportYear }),
       500
     );
     const out = { source: "tn-tref", name, electionYear, reportYear, ...result };
@@ -2612,7 +2638,7 @@ app.get("/api/tn/trend", async (req, res) => {
     // 2025 money for the 2026 cycle) only shows under reportYear = label-1, so query both years
     // per cycle and sum. The pairs are disjoint, so summing cannot double-count.
     const labelYear = cy.label.slice(0, 4);
-    let total = 0, count = 0, error = null;
+    let total = 0, count = 0, error = null, capped = false;
     for (const reportYear of [labelYear, String(Number(labelYear) - 1)]) {
       try {
         let r;
@@ -2625,13 +2651,15 @@ app.get("/api/tn/trend", async (req, res) => {
         }
         total += r.totalAmount || 0;
         count += r.count || 0;
+        if (r.count === 500) capped = true; // TREF's silent 500-row ceiling — this cycle's total is a floor, not the figure
       } catch (e) {
         error = e.message;
       }
     }
-    points.push({ year: cy.label, total, count, ...(error ? { error } : {}) });
+    points.push({ year: cy.label, total, count, ...(capped ? { truncated: true } : {}), ...(error ? { error } : {}) });
   }
-  const out = { source: "tn-tref", name, dataType, points };
+  const out = { source: "tn-tref", name, dataType, points,
+    ...(points.some((p) => p.truncated) ? { note: "At least one cycle hit TREF's 500-row search limit, so its total is understated. The yearly totals under Activity come from the filed reports and are complete." } : {}) };
   cacheSet(ck, out, TTL.tn);
   res.json(out);
 });
@@ -2780,6 +2808,19 @@ app.get("/api/tn/activity", async (req, res) => {
 // Shared by the /api/tn/ledger route AND the TN dossier (which needs the same itemized money-flows
 // data) — factored out so both reuse the same cache entry / donor-ledger ingestion instead of the
 // dossier triggering a second, redundant TREF scrape.
+// A TREF report's contributor cell is "NAME | street | CITY , ST 37027 | occupation | employer"
+// (stripTags turned the <br>s into pipes). Pull the parts out; anything missing comes back "".
+function parseTnContributor(c) {
+  const segs = String(c?.contributor || "").split("|").map((x) => x.trim());
+  const li = segs.findIndex((x) => /,\s*[A-Z]{2}\s+\d{5}/.test(x));
+  const loc = li >= 0 ? segs[li].match(/^(.*?)\s*,\s*([A-Z]{2})\s+(\d{5})/) : null;
+  return {
+    name: String(c?.name || segs[0] || "").replace(/\s+,/g, ",").replace(/\s+/g, " ").trim(),
+    city: loc?.[1]?.trim() || "", state: loc?.[2] || "", zip: loc?.[3] || "",
+    occupation: li >= 0 ? segs[li + 1] || "" : "", employer: li >= 0 ? segs[li + 2] || "" : "",
+  };
+}
+
 async function tnLedgerData(id, owner = "", forceRefresh = false, budget = 24) {
   const ck = `tn:ledger:v5:${id}`;
   if (!forceRefresh) {
@@ -2821,10 +2862,13 @@ async function tnLedgerData(id, owner = "", forceRefresh = false, budget = 24) {
       (detail.contribs || []).forEach((c, i) => {
         if (isSubtotalRow(c.name)) return;
         contribs.push({ ...c, type: classifyPayee(c.name, { purpose: c.recdFor, isExpense: false }), report, year });
+        const who = parseTnContributor(c);
         if (c.name) ledgerRows.push({ source: "tn", subId: `${r.reportId}:c${i}`, kind: "contribution",
-          donorKey: normalizeDonorKey(c.name, "TN"), donorName: c.name,
-          employer: c.employer, occupation: c.occupation, // TN rows usually carry neither → undefined
-          state: "TN", recipientId: String(id), recipientName: owner || undefined,
+          donorKey: normalizeDonorKey(who.name, who.state || "TN"), donorName: who.name,
+          employer: who.employer || undefined, occupation: who.occupation || undefined,
+          city: who.city || undefined, zip: who.zip || undefined,
+          entityType: classifyPayee(c.name, { purpose: c.recdFor, isExpense: false }) === "Individual" ? "IND" : undefined,
+          state: who.state || "TN", recipientId: String(id), recipientName: owner || undefined,
           cycle: year, date: normDate(c.date), amount: c.amount, report });
       });
       (detail.expenditures || []).forEach((e, i) => {
@@ -3385,10 +3429,10 @@ app.get("/api/admin/run-script", (req, res) => {
 // Unlike run-script's SSE (child dies with the request), the bulk import runs DETACHED from any
 // request: minutes-long, survives the browser closing. State lives in the settings table
 // (bulkLast / bulkSchedule) so "last load" and "next load" survive restarts; live log is in-memory.
-const bulkJob = { running: false, startedAt: null, cycles: null, oth: false, log: [] };
+const bulkJob = { running: false, startedAt: null, cycles: null, oth: false, indiv: false, log: [] };
 const bulkLogPush = (chunk) => {
   for (const l of String(chunk).split(/\r?\n/)) {
-    const t = l.replace(/\r.*$/, "").trim(); // progress lines rewrite with \r — keep the final form
+    const t = l.split("\r").pop().trim(); // progress lines rewrite with \r — keep the final form (text after the last \r)
     if (t) { bulkJob.log.push(t); if (bulkJob.log.length > 40) bulkJob.log.shift(); }
   }
 };
@@ -3403,16 +3447,17 @@ function bulkNextAt() {
   return (sched.lastScheduledAt || bulkLastGet()?.at || Date.now()) + every;
 }
 
-function startBulkImport({ cycles, oth, trigger }) {
+function startBulkImport({ cycles, oth, indiv, trigger }) {
   if (bulkJob.running) return { error: "A bulk import is already running — wait for it to finish." };
   // "auto" resolves to the current cycle at RUN time — schedules saved as "auto" survive the
   // 2026→2028 rollover untouched. (The script resolves it too; resolving here keeps status readable.)
   const list = [...new Set((cycles || []).map((c) => String(c).trim().toLowerCase() === "auto" ? String(currentCycle()) : String(c).trim())
     .filter((c) => /^\d{4}$/.test(c)))];
   if (!list.length) return { error: "Provide at least one cycle — a 4-digit year or 'auto' (current cycle)." };
-  bulkJob.running = true; bulkJob.startedAt = Date.now(); bulkJob.cycles = list; bulkJob.oth = !!oth; bulkJob.log = [];
+  bulkJob.running = true; bulkJob.startedAt = Date.now(); bulkJob.cycles = list; bulkJob.oth = !!oth; bulkJob.indiv = !!indiv; bulkJob.log = [];
   const args = [path.join(__dirname, "..", "scripts", "import-fec-bulk.js"), "--cycles", list.join(",")];
   if (oth) args.push("--oth");
+  if (indiv) args.push("--indiv");
   const child = spawn(process.execPath, args, { cwd: path.join(__dirname, "..") });
   child.stdout.on("data", bulkLogPush);
   child.stderr.on("data", bulkLogPush);
@@ -3420,8 +3465,8 @@ function startBulkImport({ cycles, oth, trigger }) {
     bulkJob.running = false;
     settingSet("bulkLast", JSON.stringify({
       at: Date.now(), ok, seconds: Math.round((Date.now() - bulkJob.startedAt) / 1000),
-      cycles: list, oth: !!oth, trigger,
-      summary: bulkJob.log.filter((l) => /^(cm|cn|pas2|oth)\d+: |^done /.test(l)).slice(-6).join(" · ") || bulkJob.log.slice(-2).join(" · "),
+      cycles: list, oth: !!oth, indiv: !!indiv, trigger,
+      summary: bulkJob.log.filter((l) => /^(cm|cn|pas2|oth|indiv)\d+: |^done /.test(l)).slice(-7).join(" · ") || bulkJob.log.slice(-2).join(" · "),
       ...(extra || {}),
     }));
   };
@@ -3441,7 +3486,7 @@ setInterval(() => {
       settingSet("bulkSchedule", JSON.stringify({ ...sched, lastScheduledAt: Date.now() }));
       startBulkImport({
         cycles: sched.cycles?.length ? sched.cycles : ["auto"],
-        oth: sched.oth !== false, trigger: "schedule",
+        oth: sched.oth !== false, indiv: !!sched.indiv, trigger: "schedule",
       });
     }
   } catch (e) { console.warn("[bulk-schedule]", e.message); }
@@ -3465,7 +3510,7 @@ app.get("/api/admin/bulk-import", (_req, res) => {
 
 app.post("/api/admin/bulk-import", (req, res) => {
   const cycles = Array.isArray(req.body?.cycles) ? req.body.cycles : String(req.body?.cycles || "").split(",");
-  const r = startBulkImport({ cycles, oth: !!req.body?.oth, trigger: "manual" });
+  const r = startBulkImport({ cycles, oth: !!req.body?.oth, indiv: !!req.body?.indiv, trigger: "manual" });
   if (r.error) return res.status(409).json({ error: { message: r.error } });
   res.json({ ok: true });
 });
@@ -3479,6 +3524,7 @@ app.post("/api/admin/bulk-schedule", (req, res) => {
     enabled, everyHours,
     cycles: cycles.length ? cycles : ["auto"], // stored as "auto" so the schedule rolls to new cycles
     oth: req.body?.oth !== false,
+    indiv: !!req.body?.indiv,
     lastScheduledAt: enabled ? Date.now() : null, // next run = enable time + interval
   };
   settingSet("bulkSchedule", JSON.stringify(sched));
@@ -4519,7 +4565,95 @@ Write a 150-220 word analysis of where the money comes from and where it goes: n
 });
 
 // ---- Tennessee explorer: directory, full C&E search, report search, federal dollars ----
-registerTnExplorer(app, { fecFetch, moneySearch, wantsRefresh, TTL, normalizeDonorKey, normDate, ingestScheduleA, tnLedgerData });
+const tnx = registerTnExplorer(app, { fecFetch, moneySearchAll, wantsRefresh, TTL });
+const statehouse = registerStatehouse(app, { normalizeEmployerName });
+registerCandidate(app, { fecFetch, moneySearchAll, wantsRefresh, TTL, normalizeDonorKey, normDate, ingestScheduleA,
+  tnLedgerData, parseTnContributor, normalizeEmployerName, lobbyIndex: statehouse.lobbyIndex });
+
+// ---- Tennessee auto-check: keep the directory current and raise alerts without anyone clicking ----
+// Each run: re-sync the open election cycles + PAC roster, alert on registrations first seen since
+// the previous run, then re-read the report list of every tracked TN entity and alert on new
+// filings and on large gifts inside them. All requests go through the polite TREF queue.
+const tnAutoCfg = () => {
+  let saved = {};
+  try { saved = JSON.parse(settingGet("tnAuto") || "null") || {}; } catch { /* defaults */ }
+  return { enabled: false, everyHours: 24, giftThreshold: 5000, ...saved };
+};
+const tnAutoLast = () => { try { return JSON.parse(settingGet("tnAutoLast") || "null"); } catch { return null; } };
+const tnAuto = { running: false };
+async function runTnAuto(trigger = "manual") {
+  if (tnAuto.running) return { error: "Already running." };
+  tnAuto.running = true;
+  const cfg = tnAutoCfg();
+  const since = Number(settingGet("tnAutoAt") || 0);
+  const startedAt = Date.now();
+  const alerts = [], notes = [];
+  const usd = (v) => `$${Math.round(v).toLocaleString()}`;
+  try {
+    if (!tnx.syncState.running) await tnx.runSync({ scope: "current", force: true });
+    if (tnx.syncState.errors?.length) notes.push(`directory: ${tnx.syncState.errors.length} failed`);
+    if (since) { // first run only establishes the baseline — no flood of "new" registrations
+      const fresh = tnEntityNewSince(since);
+      for (const e of fresh.slice(0, 12)) {
+        alerts.push({ kind: "tn", subject: e.name, ref: `tn-new:${e.tnId}:${e.year}`,
+          detail: `New Tennessee ${e.kind === "pac" ? "PAC" : "candidate"} registration${e.office ? ` — ${e.office}${e.district ? ` district ${e.district}` : ""}` : ""}${e.year ? ` (${e.year})` : ""}` });
+      }
+      if (fresh.length > 12) alerts.push({ kind: "tn", subject: "Tennessee registry", ref: `tn-new-more:${startedAt}`, detail: `${fresh.length - 12} more new registrations — see Tennessee → Directory` });
+    }
+    let checked = 0;
+    for (const w of tnWatchList().slice(0, 40)) {
+      const known = new Set((tnReportListGet(String(w.tnId))?.reports || []).map((r) => String(r.report_id)));
+      let list;
+      try { list = await cachedListReports(w.tnId, w.name, true); } catch (e) { notes.push(`${w.name}: ${e.message}`); continue; }
+      checked++;
+      if (!known.size) continue; // nothing stored to compare against yet
+      for (const r of (list.rows || []).filter((x) => x.reportId && !known.has(String(x.reportId))).slice(0, 4)) {
+        let detail = null;
+        try { detail = await cachedReportDetail(r.reportId, w.tnId); } catch { /* alert without totals */ }
+        const receipts = Number(detail?.totals?.receipts) || 0;
+        const label = r.cells?.[1] || "report";
+        alerts.push({ kind: "filing", subject: w.name, amount: receipts || null, ref: `tn-rep:${r.reportId}`,
+          detail: `New state filing: ${label}${receipts ? ` — ${usd(receipts)} in receipts` : ""}` });
+        const big = (detail?.contribs || []).filter((c) => (Number(c.amount) || 0) >= cfg.giftThreshold).sort((a, b) => b.amount - a.amount);
+        if (big.length) {
+          alerts.push({ kind: "tn", subject: w.name, amount: big.reduce((a, c) => a + c.amount, 0), ref: `tn-big:${r.reportId}`,
+            detail: `${big.length} gift${big.length === 1 ? "" : "s"} of ${usd(cfg.giftThreshold)}+ in ${label}: ${big.slice(0, 5).map((c) => `${String(c.name).replace(/\s+,/g, ",")} ${usd(c.amount)}`).join(" · ")}` });
+        }
+      }
+    }
+    const added = alertAdd(alerts);
+    const last = { at: Date.now(), trigger, seconds: Math.round((Date.now() - startedAt) / 1000), added, tracked: checked, ok: true, notes: notes.slice(0, 6) };
+    settingSet("tnAutoAt", String(startedAt));
+    settingSet("tnAutoLast", JSON.stringify(last));
+    return last;
+  } catch (e) {
+    const last = { at: Date.now(), trigger, ok: false, error: e.message };
+    settingSet("tnAutoLast", JSON.stringify(last));
+    return last;
+  } finally { tnAuto.running = false; }
+}
+setInterval(() => {
+  const cfg = tnAutoCfg();
+  if (!cfg.enabled || tnAuto.running) return;
+  const lastAt = tnAutoLast()?.at || 0;
+  if (Date.now() - lastAt >= Math.max(6, cfg.everyHours) * 3_600_000) runTnAuto("schedule").catch((e) => console.warn("[tn auto]", e.message));
+}, 30 * 60_000).unref();
+app.get("/api/tn/auto", (_req, res) => {
+  const cfg = tnAutoCfg(), last = tnAutoLast();
+  res.json({ ...cfg, running: tnAuto.running, last, tracked: tnWatchList().length,
+    nextAt: cfg.enabled ? (last?.at || Date.now()) + Math.max(6, cfg.everyHours) * 3_600_000 : null });
+});
+app.post("/api/tn/auto", (req, res) => {
+  const cfg = { enabled: !!req.body?.enabled, everyHours: Math.max(6, Math.min(168, Number(req.body?.everyHours) || 24)),
+    giftThreshold: Math.max(100, Math.min(1_000_000, Number(req.body?.giftThreshold) || 5000)) };
+  settingSet("tnAuto", JSON.stringify(cfg));
+  res.json({ ok: true, ...cfg });
+});
+app.post("/api/tn/auto/run", (_req, res) => {
+  if (tnAuto.running) return res.json({ running: true });
+  runTnAuto("manual").catch((e) => console.warn("[tn auto]", e.message));
+  res.json({ started: true });
+});
 
 // unknown API routes get a JSON 404, never the SPA shell
 app.all("/api/*", (req, res) => res.status(404).json({ error: { message: `No such endpoint: ${req.method} ${req.path}` } }));

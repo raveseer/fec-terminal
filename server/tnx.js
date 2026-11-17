@@ -10,8 +10,7 @@
 
 import { searchCandidatesPacs, searchReports, fetchDistricts, fetchFormMeta,
          TN_YEARS, TN_OFFICES, TN_PARTIES, TN_REPORT_TYPES } from "./tn.js";
-import { cacheGet, cacheSet, cacheGetWithAge, cacheGetStale, probeGet, probeSet,
-         contribRecipientDonorGroups, contribRecipientRowCount, contribExistingCount,
+import { cacheGet, cacheSet, cacheGetWithAge, cacheGetStale,
          tnEntityUpsertMany, tnEntitySearch, tnEntityStats, tnEntityFacets, tnSyncMark, tnSyncGet } from "./db.js";
 
 const HOUR = 3_600_000, DAY = 86_400_000;
@@ -30,31 +29,43 @@ const AWARD_GROUPS = {
   other: ["09", "11", "-1"],
 };
 
-export function registerTnExplorer(app, { fecFetch, moneySearch, wantsRefresh, TTL, normalizeDonorKey, normDate, ingestScheduleA, tnLedgerData }) {
-  const fail = (res, code, message) => res.status(code).json({ error: { message } });
-
-  // Generic cached upstream call: cache → coalesce identical in-flight calls → stale copy on failure.
-  const inflight = new Map();
-  async function cached(key, ttlMs, fetcher, { force = false } = {}) {
-    if (!force) {
-      const hit = cacheGetWithAge(key);
-      if (hit) return { ...hit.value, cachedAt: hit.createdAt };
-    }
-    if (inflight.has(key)) return inflight.get(key);
-    const p = (async () => {
-      try {
-        const value = await fetcher();
-        cacheSet(key, value, typeof ttlMs === "function" ? ttlMs(value) : ttlMs);
-        return value;
-      } catch (e) {
-        const stale = cacheGetStale(key);
-        if (stale) return { ...stale.value, cachedAt: stale.createdAt, stale: true, note: `Live source failed (${e.message}) — showing the saved copy.` };
-        throw e;
-      }
-    })().finally(() => inflight.delete(key));
-    inflight.set(key, p);
-    return p;
+// Generic cached upstream call: cache → coalesce identical in-flight calls → stale copy on failure.
+const inflight = new Map();
+export async function cached(key, ttlMs, fetcher, { force = false } = {}) {
+  if (!force) {
+    const hit = cacheGetWithAge(key);
+    if (hit) return { ...hit.value, cachedAt: hit.createdAt };
   }
+  if (inflight.has(key)) return inflight.get(key);
+  const p = (async () => {
+    try {
+      const value = await fetcher();
+      cacheSet(key, value, typeof ttlMs === "function" ? ttlMs(value) : ttlMs);
+      return value;
+    } catch (e) {
+      const stale = cacheGetStale(key);
+      if (stale) return { ...stale.value, cachedAt: stale.createdAt, stale: true, note: `Live source failed (${e.message}) — showing the saved copy.` };
+      throw e;
+    }
+  })().finally(() => inflight.delete(key));
+  inflight.set(key, p);
+  return p;
+}
+
+// USAspending.gov search API (POST, JSON, no key).
+export async function usa(pathname, body) {
+  const r = await fetch(`https://api.usaspending.gov/api/v2/${pathname}`, {
+    method: "POST", headers: { "content-type": "application/json", "user-agent": UA },
+    body: JSON.stringify(body), signal: AbortSignal.timeout(30_000),
+  });
+  const data = await r.json().catch(() => null);
+  if (!r.ok || !data) throw new Error(data?.detail || data?.message || `USAspending HTTP ${r.status}`);
+  return data;
+}
+export const currentFY = () => { const d = new Date(); return d.getMonth() >= 9 ? d.getFullYear() + 1 : d.getFullYear(); };
+
+export function registerTnExplorer(app, { fecFetch, moneySearchAll, wantsRefresh, TTL }) {
+  const fail = (res, code, message) => res.status(code).json({ error: { message } });
 
   // =====================================================================================
   //  Form metadata + districts
@@ -158,230 +169,6 @@ export function registerTnExplorer(app, { fecFetch, moneySearch, wantsRefresh, T
   });
 
   // =====================================================================================
-  //  Candidate donors — type a name, get every donor across the candidate's federal (FEC)
-  //  committees and state (TREF) accounts in one list.
-  // =====================================================================================
-  const CONDUIT_RE = /^(WINRED|ACTBLUE|ACT BLUE|WINRED TECHNICAL|DEMOCRACY ENGINE|ANEDOT)\b/;
-  const CUR_CYCLE = (() => { const y = new Date().getFullYear(); return y % 2 ? y + 1 : y; })();
-  const tokensOf = (q) => String(q || "").toUpperCase().replace(/[^A-Z0-9 ]/g, " ").split(/\s+/).filter((t) => t.length >= 2);
-  const hasAll = (name, toks) => { const n = String(name || "").toUpperCase(); return toks.every((t) => n.includes(t)); };
-
-  // Step 1: which accounts belong to this name? Federal: FEC candidate search limited to TN.
-  // State: the local directory first (no web call); TREF only if the directory has no match.
-  app.get("/api/tn/candidate/find", async (req, res) => {
-    const q = qstr(req.query.q).trim();
-    const toks = tokensOf(q);
-    if (!toks.length) return fail(res, 400, "Type a candidate's name (at least two letters).");
-    const out = { q, federal: [], state: [], notes: [] };
-
-    // ---- federal ----
-    try {
-      const mapCand = (c) => ({
-        candId: c.candidate_id, name: c.name, party: c.party_full || c.party || "", office: c.office,
-        district: c.office === "H" ? String(c.district || "").padStart(2, "0") : "",
-        cycles: (c.cycles || []).map(String).sort().reverse(), electionYears: (c.election_years || []).map(String),
-        incumbent: c.incumbent_challenge_full || "", active: c.candidate_status === "C",
-        committees: (c.principal_committees || []).map((pc) => ({ id: pc.committee_id, name: pc.name, cycles: (pc.cycles || []).map(String) })),
-      });
-      const seen = new Map();
-      // the FEC matches whole words; try the phrase, then each word (surname last = most likely), and keep rows containing every word
-      for (const term of [q, ...[...toks].reverse()]) {
-        const d = await fecFetch("candidates/search/", { q: term, state: "TN", per_page: "50" });
-        for (const c of d.results || []) if (hasAll(c.name, toks) && !seen.has(c.candidate_id)) seen.set(c.candidate_id, mapCand(c));
-        if (seen.size) break;
-      }
-      // active candidacy first; a committee reused across candidacies (House → Senate) is listed once, under the first
-      const claimed = new Set();
-      out.federal = [...seen.values()]
-        .sort((a, b) => (Number(b.active) - Number(a.active)) || (b.cycles[0] || "").localeCompare(a.cycles[0] || ""))
-        .map((c) => ({ ...c, committees: c.committees.filter((pc) => !claimed.has(pc.id) && claimed.add(pc.id)) }));
-    } catch (e) { out.notes.push(`Federal lookup failed: ${e.message}`); }
-
-    // ---- state ----
-    const fromDirectory = () => tnEntitySearch({ q: toks.join(" "), limit: 200 }).rows.filter((r) => hasAll(r.name, toks));
-    let rows = fromDirectory();
-    if (!rows.length) {
-      try {
-        // TREF indexes candidates by last name; search the longest word first, keep rows containing every word
-        for (const term of [...toks].sort((a, b) => b.length - a.length).slice(0, 2)) {
-          const ck = `tn:candfind:v1:${term}`;
-          const data = await cached(ck, (v) => (v.count ? TTL.tn : 5 * 60_000), () => searchCandidatesPacs({ name: `%${term}`, type: "both", full: true }));
-          if (data.entities?.length) tnEntityUpsertMany(data.entities);
-          rows = (data.entities || []).filter((r) => hasAll(r.name, toks));
-          if (rows.length) break;
-        }
-      } catch (e) { out.notes.push(`State lookup failed: ${e.message}`); }
-    }
-    const byId = new Map();
-    for (const r of rows) {
-      const g = byId.get(r.tnId) || { tnId: r.tnId, name: r.name, kind: r.kind, party: r.party || "", office: r.office || "", district: r.district || "", years: [] };
-      if (r.year && !g.years.includes(r.year)) g.years.push(r.year);
-      byId.set(r.tnId, g);
-    }
-    out.state = [...byId.values()].map((g) => ({ ...g, years: g.years.sort().reverse() }))
-      .sort((a, b) => (b.years[0] || "").localeCompare(a.years[0] || ""));
-    res.json(out);
-  });
-
-  // ---- background pull of a committee's itemized receipts (Schedule A) ----
-  // The FEC hands out 100 rows per call, so "every donor" of a big committee is hundreds of calls.
-  // Rows are pulled largest-first and stored permanently; progress is saved so a pull can stop at a
-  // cap, resume later, survive a rate limit, and never refetch a finished closed cycle.
-  const pull = { running: false, startedAt: null, finishedAt: null, items: [], current: null, status: "", errors: [] };
-  const pullKey = (cmte, cycle) => `fec:pullall:${cmte}:${cycle}`;
-  const pullState = (cmte, cycle) => probeGet(pullKey(cmte, cycle))?.payload || null;
-  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-  async function fecPage(params) {
-    for (let attempt = 0; ; attempt++) {
-      try { return await fecFetch("schedules/schedule_a/", params); }
-      catch (e) {
-        const limited = /rate limit|429|OVER_RATE/i.test(e.message);
-        if (limited && attempt < 40) { pull.status = "Waiting for the FEC rate limit to reset…"; await sleep(65_000); pull.status = ""; continue; }
-        if (!limited && attempt < 2) { await sleep(2000); continue; }
-        throw e;
-      }
-    }
-  }
-  async function pullCommitteeCycle(item, cap) {
-    const { committee, cycle } = item;
-    const closed = Number(cycle) < CUR_CYCLE;
-    const prev = pullState(committee, cycle);
-    const save = (st) => probeSet(pullKey(committee, cycle), String(st.available ?? ""), { ...st, at: Date.now() });
-    const base = { committee_id: committee, two_year_transaction_period: String(cycle), per_page: "100" };
-
-    if (prev?.complete) {
-      if (closed || Date.now() - (prev.at || 0) < DAY) { Object.assign(item, { pulled: prev.pulled, available: prev.available, complete: true, skipped: true }); return; }
-      // open cycle, already complete once: only fetch what was filed since — newest first, stop at the first page with nothing new
-      let cursor = null, added = 0, available = prev.available;
-      for (let page = 0; page < 400; page++) {
-        const d = await fecPage({ ...base, sort: "-contribution_receipt_date", ...(cursor || {}) });
-        const results = d.results || [];
-        available = d.pagination?.count ?? available;
-        const known = contribExistingCount("fec", results.map((r) => r.sub_id));
-        ingestScheduleA(results);
-        added += results.length - known;
-        Object.assign(item, { pulled: (prev.pulled || 0) + added, available });
-        cursor = d.pagination?.last_indexes ? Object.fromEntries(Object.entries(d.pagination.last_indexes).filter(([, v]) => v != null).map(([k, v]) => [k, String(v)])) : null;
-        if (!cursor || results.length < 100 || known === results.length) break;
-        await sleep(250);
-      }
-      save({ available, pulled: (prev.pulled || 0) + added, complete: true, cursor: null });
-      item.complete = true;
-      return;
-    }
-
-    let cursor = prev?.cursor || null, pulled = cursor ? prev.pulled || 0 : 0, available = prev?.available ?? null, complete = false, pages = 0;
-    while (true) {
-      const d = await fecPage({ ...base, sort: "-contribution_receipt_amount", ...(cursor || {}) });
-      const results = d.results || [];
-      ingestScheduleA(results);
-      available = d.pagination?.count ?? available;
-      pulled += results.length;
-      Object.assign(item, { pulled, available });
-      cursor = d.pagination?.last_indexes ? Object.fromEntries(Object.entries(d.pagination.last_indexes).filter(([, v]) => v != null).map(([k, v]) => [k, String(v)])) : null;
-      if (!cursor || results.length < 100) { complete = true; break; }
-      if (pulled >= cap) break;
-      if (++pages % 10 === 0) save({ available, pulled, complete: false, cursor });
-      await sleep(250);
-    }
-    save({ available, pulled, complete, cursor: complete ? null : cursor });
-    item.complete = complete;
-  }
-  async function runPull(pairs, cap) {
-    Object.assign(pull, { running: true, startedAt: Date.now(), finishedAt: null, errors: [], status: "", current: null,
-      items: pairs.map((p) => ({ ...p, pulled: 0, available: null, complete: false, done: false })) });
-    for (const item of pull.items) {
-      pull.current = `${item.committee} · ${item.cycle}`;
-      try { await pullCommitteeCycle(item, cap); }
-      catch (e) { item.error = e.message; pull.errors.push(`${item.committee} ${item.cycle}: ${e.message}`); }
-      item.done = true;
-    }
-    Object.assign(pull, { running: false, finishedAt: Date.now(), current: null, status: "" });
-  }
-  const cleanCommittees = (v) => [...new Set((Array.isArray(v) ? v : []).map((x) => String(x).toUpperCase()).filter((x) => /^C\d{5,9}$/.test(x)))].slice(0, 8);
-  const cleanCycles = (v) => [...new Set((Array.isArray(v) ? v : []).map(String).filter((x) => /^(19|20)\d{2}$/.test(x) && Number(x) % 2 === 0))].slice(0, 10);
-  app.get("/api/tn/candidate/pull", (_req, res) => res.json(pull));
-  app.post("/api/tn/candidate/pull", (req, res) => {
-    if (pull.running) return res.json({ ...pull, alreadyRunning: true });
-    const committees = cleanCommittees(req.body?.committees), cycles = cleanCycles(req.body?.cycles);
-    if (!committees.length || !cycles.length) return fail(res, 400, "Pick at least one federal committee and one cycle.");
-    const cap = req.body?.full ? 500_000 : Math.min(20_000, Math.max(500, Number(req.body?.cap) || 3000));
-    const pairs = committees.flatMap((committee) => cycles.map((cycle) => ({ committee, cycle })));
-    runPull(pairs, cap).catch((e) => { pull.running = false; pull.errors.push(e.message); });
-    res.json({ started: true, pairs: pairs.length, cap });
-  });
-
-  // Step 2: the merged donor list. Federal side reads the stored ledger (instant). State side reads
-  // the itemized contributor schedules of the account's actual filed reports — NOT TREF's
-  // contribution search, which silently stops at 500 rows per query (verified Nov 2026: that search
-  // returned 500 rows / $57K for an account whose reports itemize 52,890 gifts / $13.7M).
-  app.post("/api/tn/candidate/donors", async (req, res) => {
-    const committees = cleanCommittees(req.body?.committees), cycles = cleanCycles(req.body?.cycles);
-    const state = (Array.isArray(req.body?.state) ? req.body.state : []).slice(0, 6)
-      .map((s) => ({ tnId: String(s?.tnId || ""), name: String(s?.name || "").trim().slice(0, 120) }))
-      .filter((s) => /^\d{1,12}$/.test(s.tnId));
-    if (!committees.length && !state.length) return fail(res, 400, "Pick at least one federal committee or state account.");
-    const donors = new Map();
-    const slot = (key, seed) => { let g = donors.get(key); if (!g) { g = { key, federal: 0, stateAmt: 0, fedCount: 0, stateCount: 0, firstDate: null, lastDate: null, ...seed }; donors.set(key, g); } return g; };
-    const dates = (g, a, b) => { if (a && (!g.firstDate || a < g.firstDate)) g.firstDate = a; if (b && (!g.lastDate || b > g.lastDate)) g.lastDate = b; };
-    const conduits = { total: 0, count: 0, names: [] };
-
-    // ---- federal ----
-    const coverage = [];
-    if (committees.length) {
-      for (const g of contribRecipientDonorGroups(committees, { cycles })) {
-        if (CONDUIT_RE.test(String(g.name || "").toUpperCase())) { conduits.total += g.total; conduits.count += g.count; if (!conduits.names.includes(g.name)) conduits.names.push(g.name); continue; }
-        const d = slot(g.donorKey, { name: g.name, city: g.city || "", st: g.state || "", employer: g.employer || "", occupation: g.occupation || "", type: g.entityType || "" });
-        d.federal += Number(g.total) || 0; d.fedCount += Number(g.count) || 0;
-        dates(d, g.firstDate, g.lastDate);
-      }
-      for (const c of committees) for (const cy of (cycles.length ? cycles : [""])) {
-        const st = cy ? pullState(c, cy) : null;
-        coverage.push({ committee: c, cycle: cy, stored: contribRecipientRowCount(c, cy), available: st?.available ?? null, complete: Boolean(st?.complete), pulledAt: st?.at ?? null });
-      }
-    }
-
-    // ---- state ----
-    const stateAccounts = [];
-    for (const acct of state) {
-      try {
-        const led = await tnLedgerData(acct.tnId, acct.name, wantsRefresh(), 80);
-        const byYear = new Map();
-        for (const c of led.contribs || []) {
-          // contributor cell: "NAME | street | CITY , ST 37027 | occupation | employer"
-          const segs = String(c.contributor || "").split("|").map((x) => x.trim());
-          const li = segs.findIndex((x) => /,\s*[A-Z]{2}\s+\d{5}/.test(x));
-          const loc = li >= 0 ? segs[li].match(/^(.*?)\s*,\s*([A-Z]{2})\s+\d{5}/) : null;
-          const name = String(c.name || segs[0] || "").replace(/\s+,/g, ",").replace(/\s+/g, " ").trim();
-          if (!name) continue;
-          const st = loc?.[2] || "";
-          const amt = Number(c.amount) || 0;
-          const d = slot(normalizeDonorKey(name, st), { name, city: loc?.[1]?.trim() || "", st, employer: "", occupation: "",
-            type: /individual/i.test(c.type || "") ? "IND" : (c.type || "") });
-          if (li >= 0) { if (!d.occupation && segs[li + 1]) d.occupation = segs[li + 1]; if (!d.employer && segs[li + 2]) d.employer = segs[li + 2]; }
-          d.stateAmt += amt; d.stateCount++;
-          const iso = normDate(c.date); dates(d, iso, iso);
-          const y = byYear.get(c.year) || { year: c.year, count: 0, total: 0 };
-          y.count++; y.total += amt; byYear.set(c.year, y);
-        }
-        stateAccounts.push({ tnId: acct.tnId, name: acct.name || led.name, reportsRead: led.reportsRead, reportsTotal: led.reportsTotal, partial: Boolean(led.partial),
-          itemized: led.totalReceived, reportedReceipts: led.reportedReceipts ?? null, note: led.note,
-          years: [...byYear.values()].map((y) => ({ ...y, total: Math.round(y.total) })).sort((a, b) => String(b.year).localeCompare(String(a.year))) });
-      } catch (e) { stateAccounts.push({ tnId: acct.tnId, name: acct.name, error: e.message }); }
-    }
-
-    const list = [...donors.values()].map((d) => ({ ...d, federal: Math.round(d.federal * 100) / 100, stateAmt: Math.round(d.stateAmt * 100) / 100,
-      total: Math.round((d.federal + d.stateAmt) * 100) / 100, count: d.fedCount + d.stateCount }))
-      .sort((a, b) => b.total - a.total);
-    res.json({
-      donors: list,
-      totals: { donors: list.length, federal: Math.round(list.reduce((a, d) => a + d.federal, 0)), state: Math.round(list.reduce((a, d) => a + d.stateAmt, 0)),
-        both: list.filter((d) => d.federal && d.stateAmt).length, gifts: list.reduce((a, d) => a + d.count, 0) },
-      coverage, stateAccounts, conduits: { ...conduits, total: Math.round(conduits.total) }, pull: { running: pull.running },
-    });
-  });
-
-  // =====================================================================================
   //  Full contributions / expenditures search
   // =====================================================================================
   const moneyCol = (headers, re) => headers.findIndex((h) => re.test(h));
@@ -436,12 +223,12 @@ export function registerTnExplorer(app, { fecFetch, moneySearch, wantsRefresh, T
     const rows = [], perYear = [], errors = [];
     for (const ry of years) {
       try {
-        const r = await moneySearch({ ...args, reportYear: ry });
+        const r = await moneySearchAll({ ...args, reportYear: ry });
         if (!headers.length && r.headers?.length) headers = r.headers;
         const amtIdx = moneyCol(r.headers || [], /^amount$/i);
         const yrRows = r.rows || [];
         perYear.push({ year: ry, count: r.count || yrRows.length, total: Math.round(yrRows.reduce((a, x) => a + parseAmt(x[amtIdx]), 0)), note: r.note || undefined,
-          truncated: yrRows.length === 500 }); // TREF stops a search at 500 rows without saying so
+          truncated: Boolean(r.truncated), split: Boolean(r.split) });
         rows.push(...yrRows);
       } catch (e) { errors.push(`${ry}: ${e.message}`); perYear.push({ year: ry, count: 0, total: 0, error: e.message }); }
     }
@@ -528,16 +315,6 @@ export function registerTnExplorer(app, { fecFetch, moneySearch, wantsRefresh, T
   // =====================================================================================
   //  Federal dollars into Tennessee — USAspending.gov (contracts, grants, loans, direct payments)
   // =====================================================================================
-  async function usa(pathname, body) {
-    const r = await fetch(`https://api.usaspending.gov/api/v2/${pathname}`, {
-      method: "POST", headers: { "content-type": "application/json", "user-agent": UA },
-      body: JSON.stringify(body), signal: AbortSignal.timeout(30_000),
-    });
-    const data = await r.json().catch(() => null);
-    if (!r.ok || !data) throw new Error(data?.detail || data?.message || `USAspending HTTP ${r.status}`);
-    return data;
-  }
-  const currentFY = () => { const d = new Date(); return d.getMonth() >= 9 ? d.getFullYear() + 1 : d.getFullYear(); };
   // Shared filter builder. place = where the work is performed (not where the recipient is based).
   function usaFilters(req) {
     const fy = /^20\d{2}$/.test(qstr(req.query.fy)) ? Number(req.query.fy) : currentFY();
@@ -625,4 +402,5 @@ export function registerTnExplorer(app, { fecFetch, moneySearch, wantsRefresh, T
       res.json(out);
     } catch (e) { fail(res, 502, `USAspending lookup failed: ${e.message}`); }
   });
+  return { runSync, syncState: sync };
 }
