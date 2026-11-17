@@ -205,8 +205,9 @@ export function registerCandidate(app, { fecFetch, moneySearchAll, wantsRefresh,
     const committees = cleanCommittees(req.body?.committees), cycles = cleanCycles(req.body?.cycles);
     if (!committees.length || !cycles.length) return fail(res, 400, "Pick at least one federal committee and one cycle.");
     const cap = req.body?.full ? 500_000 : Math.min(20_000, Math.max(500, Number(req.body?.cap) || 3000));
-    const pairs = committees.flatMap((committee) => cycles.map((cycle) => ({ committee, cycle }))).filter((p) => !bulkCover(p.committee, p.cycle));
-    if (!pairs.length) return res.json({ started: false, reason: "Already complete from the bulk file." });
+    // the automatic first-look pull is skipped where the bulk file already covers the committee; an explicit "pull the rest" still runs
+    const pairs = committees.flatMap((committee) => cycles.map((cycle) => ({ committee, cycle }))).filter((p) => req.body?.full || !bulkCover(p.committee, p.cycle));
+    if (!pairs.length) return res.json({ started: false, reason: "Covered by the bulk file." });
     runPull(pairs, cap).catch((e) => { pull.running = false; pull.errors.push(e.message); });
     res.json({ started: true, pairs: pairs.length, cap });
   });
@@ -245,7 +246,10 @@ export function registerCandidate(app, { fecFetch, moneySearchAll, wantsRefresh,
       for (const c of committees) for (const cy of (cycles.length ? cycles : [""])) {
         const st = cy ? pullState(c, cy) : null, bulk = cy ? bulkCover(c, cy) : null;
         coverage.push({ committee: c, name: fecCommitteeGet(c)?.name || c, cycle: cy, stored: contribRecipientRowCount(c, cy), available: st?.available ?? null,
-          complete: Boolean(bulk || st?.complete), via: bulk ? "bulk" : st?.complete ? "api" : null, asOf: bulk?.at ?? st?.at ?? null });
+          // "complete" = every line the committee itemized (API pull finished). The bulk file is
+          // narrower by design: donors whose giving passed $200, without the small earmarked gifts
+          // committees also itemize — so a bulk load is reported separately, not as complete.
+          complete: Boolean(st?.complete), bulkAt: bulk?.at ?? null, asOf: st?.at ?? null });
       }
     }
 

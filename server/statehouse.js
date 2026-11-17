@@ -173,12 +173,12 @@ export function registerStatehouse(app, { normalizeEmployerName }) {
       for (const chamber of ["H", "S"]) {
         const p = await get(`${CAPITOL}/LegislatorInfo/Directory?chamber=${chamber}`);
         for (const m of p.text.matchAll(/<tr[^>]*>([\s\S]*?)<\/tr>/gi)) {
-          const link = m[1].match(/LegislatorInfo\/Member\?district=([HS])(\d+)&(?:amp;)?ga=(\d+)"[^>]*>([^<]+)<\/a>/i);
+          const link = m[1].match(/LegislatorInfo\/Member\?district=([HS])(\d+)&(?:amp;)?ga=(\d+)['"][^>]*>([^<]+)<\/a>/i); // the site quotes hrefs with single quotes
           if (!link) continue;
           const cells = [...m[1].matchAll(/<td[^>]*>([\s\S]*?)<\/td>/gi)].map((c) => strip(c[1]));
-          const bills = m[1].match(/href="([^"]*SponsorList\?[^"]+)"/i)?.[1]?.replace(/&amp;/g, "&") || "";
+          const bills = m[1].match(/href=['"]([^'"]*SponsorList\?[^'"]+)['"]/i)?.[1]?.replace(/&amp;/g, "&") || "";
           members.push({ chamber: link[1].toUpperCase(), district: String(Number(link[2])), ga: link[3], name: strip(link[4]),
-            party: cells.find((c) => /^[RDI]$/.test(c)) || "", email: (m[1].match(/mailto:([^"]+)"/i) || [])[1] || "",
+            party: cells.find((c) => /^[RDI]$/.test(c)) || "", email: (m[1].match(/mailto:([^'"]+)['"]/i) || [])[1] || "",
             memberUrl: `${CAPITOL}/LegislatorInfo/Member?district=${link[1]}${link[2]}&ga=${link[3]}`, billsUrl: bills });
         }
         await sleep(600);
@@ -221,7 +221,7 @@ export function registerStatehouse(app, { normalizeEmployerName }) {
           for (const r of p.text.matchAll(/<tr[^>]*>([\s\S]*?)<\/tr>/gi)) {
             const cells = [...r[1].matchAll(/<td[^>]*>([\s\S]*?)<\/td>/gi)].map((c) => strip(c[1]));
             if (cells.length >= 4 && /^[HS][BJR]+\s*\d+/i.test(cells[0])) {
-              const href = r[1].match(/href="([^"]+)"/i)?.[1]?.replace(/&amp;/g, "&") || "";
+              const href = r[1].match(/href=['"]([^'"]+)['"]/i)?.[1]?.replace(/&amp;/g, "&") || "";
               bills.push({ ga, number: cells[0], abstract: cells[1].slice(0, 300), lastAction: cells[2], date: cells[3], url: href.startsWith("http") ? href : href ? `https://wapp.capitol.tn.gov${href}` : "" });
             }
           }

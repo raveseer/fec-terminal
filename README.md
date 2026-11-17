@@ -1,4 +1,4 @@
-# FEC Records Terminal v4.1
+# FEC Records Terminal v4.2
 
 Self-hosted explorer for the OpenFEC API with local-AI donor analysis and Tennessee
 state-records search.
@@ -27,11 +27,19 @@ state-records search.
   are cached + force-refreshable. Needs a tool-capable model (`OLLAMA_TOOL_MODEL`, default
   `mistral-small3.2:latest`, selectable in Admin); web search is optional (`SEARCH_API_KEY`) and
   degrades to FEC/TN/Wikipedia/news when unset.
-- **Tennessee tab** — seven ways into Tennessee money, all sharing one cache:
-  - *Candidate donors* — type a name, pick the matching federal committees and state account,
-    and get one merged donor list (federal $ / state $ / total per donor, CSV export). Federal
-    rows are pulled from Schedule A largest-first in a resumable background job; state rows come
-    from the account's filed reports (TREF's own contribution search stops at 500 rows).
+- **Tennessee tab** — eleven ways into Tennessee money, all sharing one cache:
+  - *Candidate* — type a name, pick the matching federal committees (principal, joint
+    fundraising, leadership PAC) and state account, and open one page: merged donor list
+    (federal $ / state $ / total, identities merged, CSV), where the money comes from (state,
+    Tennessee county, ZIP, city), donors' employers matched to federal award recipients and to
+    the state lobbying roster, spending and outside money, and — for sitting legislators —
+    committee seats and sponsored bills. State rows come from the account's filed reports
+    (TREF's own contribution search stops at 500 rows).
+  - *Outside spending* — state independent expenditures by candidate, for and against.
+  - *By place* — pick a ZIP, county or city: who there gives, and to whom (state + federal).
+  - *Lobbying* — the Ethics Commission roster: employers of lobbyists, lobbyists, who lobbies
+    for whom by year.
+  - *Legislature* — General Assembly members, committee assignments, sponsored bills.
   - *Registry* — per-entity workspace on the Tennessee Registry of Election Finance (TREF,
     apps.tn.gov/tncamp): report lists, itemized ledgers, money flows, AI profiles, tracking.
     Name search is a single `%wildcard` contains-match; filters for office, district, party,
@@ -48,6 +56,22 @@ state-records search.
   - *Federal dollars* — USAspending.gov contracts, grants, loans and direct payments by
     Tennessee county or congressional district: recipients, agencies, programs, largest awards.
   Requests to the state site are serialized and rate-spaced.
+
+## Getting every federal donor: the bulk load
+
+Admin → *Load bulk data* with **TN individual donors (indiv)** ticked streams the FEC's
+nationwide individual-contributions file for each cycle (1–2 GB compressed; only the first zip
+entry is requested, nothing is written to disk) and keeps two slices: gifts to committees based
+in or linked to Tennessee, and gifts from Tennessee residents to anyone. A cycle takes a few
+minutes and adds roughly a million rows. The file contains donors whose giving passed $200; the
+smaller earmarked gifts some committees also itemize are only available through the API pull on
+the Candidate page. CLI: `node scripts/import-fec-bulk.js --cycles 2026,2024 --indiv`.
+
+## Automatic Tennessee check
+
+Tennessee → Directory → *Automatic check* (off by default). Each run re-syncs the current
+cycles, then re-reads the report list of every tracked (★) state entity and raises alerts under
+the bell for new registrations, new filings, and gifts over the chosen threshold.
 
 ## Deploy
 
@@ -145,6 +169,12 @@ the initial default).
   directory search; `GET|POST /api/tn/directory/sync` — status / start a sync (`{scope: "current"|"all"}`)
 - `/api/tn/explore/money?kind=&years=2026,2025&contributor=&recipient=&employer=&occupation=&zip=&by=&vendor=&vendorZip=&purpose=&typeOf=&amountOp=&amount=&reportTypes=`
 - `/api/tn/explore/reports?reportYear=&name=&for=&office=&district=&party=&electionYear=&reportTypes=`
+- `/api/tn/candidate/find?q=`, `POST /api/tn/candidate/donors|geo|employers|spending`
+  (`{committees, cycles, state: [{tnId, name}], candIds}`), `GET|POST /api/tn/candidate/pull`
+- `/api/tn/place?zip=|county=|city=`, `/api/tn/ie?year=`
+- `/api/tn/lobby?q=`, `/api/tn/lobby/employer/:id`, `/api/tn/lobby/lobbyist/:id`
+- `/api/tn/legislature`, `/api/tn/legislature/member?chamber=H|S&district=`
+- `GET|POST /api/tn/auto`, `POST /api/tn/auto/run`
 - `/api/tn/federal/races?cycle=` — FEC totals for every TN federal candidate, grouped by race
 - `/api/tn/federal/spending/geo|summary|awards?fy=&county=&district=&group=&q=` — USAspending
 - `/api/health`, `/api/ollama/health` — Homepage-widget friendly

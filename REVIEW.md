@@ -220,3 +220,38 @@ navigation, Donors and Tennessee stay mounted between tab switches.
 - Tennessee sources not covered: Ethics Commission lobbyist registrations, county/municipal
   campaign filings (each county election commission publishes separately), the state checkbook.
 - A scheduled nightly "sync current cycles" + TREF new-filing alerts would pair with §3-D.
+
+---
+
+## 7. November 2026, second pass (v4.2.0)
+
+Built, in order: bulk individual-donor load; donor identity merging; donors' employers joined to
+federal award recipients; affiliated-committee roll-up; Registry views protected against TREF's
+500-row search cap; scheduled Tennessee check with alerts; geography (candidate and by-place);
+state independent expenditures by race; the single candidate page; the Ethics Commission lobbying
+roster; General Assembly members/committees/bills.
+
+**Facts established against the live sources (worth knowing before changing this code).**
+- `indivYY.zip` holds `itcont.txt` as its FIRST entry, followed by the same rows split by date.
+  The importer range-requests only that entry. 2026: 1.3 GB compressed, read and filtered in
+  ~2 minutes, ~1M Tennessee rows.
+- The bulk indiv file is donors past $200. A committee's Schedule A on the API can be far larger
+  (Marsha for Senate 2025-26: 6,239 bulk rows vs 279,135 itemized lines) because committees
+  itemize small earmarked gifts too. Coverage on the Candidate page says which of the two it has.
+- TREF's contribution search silently stops at 500 rows (one account: 500 rows / $57K from the
+  search vs 52,890 gifts / $13.7M in its filed reports). `moneySearchAll` splits a capped search
+  by report type and flags `truncated` when a slice is still capped. Expenditure searches did
+  not show the cap in testing (777 independent-expenditure rows for 2026).
+- Joint fundraising committees are often not linked to the candidate record; they are found from
+  transfers into the principal committee.
+- capitol.tn.gov quotes hrefs with single quotes; a newly seated General Assembly has no bills,
+  so the member card falls back to the previous one.
+
+**Identity rules** (`server/identity.js`): strict = same surname + given names once courtesy
+titles are dropped + state; loose = same first and last name, suffix and ZIP with non-conflicting
+middle initials. Applied on the Candidate page only — the Donors tab still groups by the stored
+`donor_key`.
+
+**Not built.** County and municipal campaign filings (each county election commission publishes
+separately; no common source was found or verified). The Donors tab does not yet use identity
+merging. `App.jsx` is still one file.

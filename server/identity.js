@@ -4,8 +4,11 @@
 // "SMITH, JOHN A" are three donors. Two rules merge them, deliberately conservative:
 //   strict: same surname + same given names once courtesy titles are dropped + same state
 //           ("HASLAM, JAMES A. III" = "HASLAM, JAMES A. MR. III")
-//   loose:  same surname + same FIRST name + same suffix + same 5-digit ZIP
-//           ("SMITH, JOHN" = "SMITH, JOHN A" when both are in 37660). Needs a ZIP on both records.
+//   loose:  same surname + same FIRST name + same suffix + same 5-digit ZIP, and middle initials
+//           that don't conflict ("SMITH, JOHN" = "SMITH, JOHN A" in 37660). A record with no middle
+//           initial only joins an initialed one when that ZIP has exactly ONE such initial —
+//           "MICHAEL A", "MICHAEL C" and "MICHAEL N" at one address stay three people, and a bare
+//           "MICHAEL" there stays on its own rather than gluing them together.
 // Organizations (anything that isn't LAST, FIRST) match on name with corporate/PAC suffixes removed.
 // Father/son pairs (JR vs SR / II vs III) never merge, and nothing merges on name alone.
 
@@ -41,14 +44,25 @@ export function parseDonorName(name) {
 }
 
 // Matching keys for one record. Two records are the same donor when they share any key.
-export function identityKeys({ name, state = "", zip = "" }) {
+// `initials` (optional): Map of loose-base → Set of middle initials seen there, from looseBase().
+export function identityKeys({ name, state = "", zip = "" }, initials = null) {
   const p = parseDonorName(name);
   const st = String(state || "").toUpperCase().trim();
-  const z = /^\d{5}/.test(String(zip || "")) ? String(zip).slice(0, 5) : "";
   if (!p.person) return p.org ? [`O|${p.org}`] : [];
   const keys = [`S|${p.last}|${p.given}|${p.suffix}|${st}`];
-  if (z) keys.push(`L|${p.last}|${p.first}|${p.suffix}|${z}`);
+  const base = looseBase({ name, zip }, p);
+  if (base) {
+    let mi = middleInitial(p);
+    if (!mi) { const seen = initials?.get(base); mi = seen && seen.size === 1 ? [...seen][0] : ""; }
+    keys.push(`L|${base}|${mi}`);
+  }
   return keys;
+}
+const middleInitial = (p) => (p.given.split(" ")[1] || "").slice(0, 1);
+export function looseBase({ name, zip = "" }, parsed = null) {
+  const p = parsed || parseDonorName(name);
+  const z = /^\d{5}/.test(String(zip || "")) ? String(zip).slice(0, 5) : "";
+  return p.person && z ? `${p.last}|${p.first}|${p.suffix}|${z}` : "";
 }
 
 // Union-find merge of donor groups. `groups` items need { name, state|st, zip }; `combine(into, from)`
@@ -58,8 +72,15 @@ export function mergeDonorGroups(groups, { weight = (g) => g.total || 0, combine
   const parent = groups.map((_, i) => i);
   const find = (i) => { while (parent[i] !== i) { parent[i] = parent[parent[i]]; i = parent[i]; } return i; };
   const seen = new Map();
+  const initials = new Map(); // loose base → middle initials present, so bare names only join an unambiguous one
+  for (const g of groups) {
+    const p = parseDonorName(g.name);
+    const base = looseBase({ name: g.name, zip: g.zip }, p);
+    const mi = p.person ? middleInitial(p) : "";
+    if (base && mi) (initials.get(base) || initials.set(base, new Set()).get(base)).add(mi);
+  }
   groups.forEach((g, i) => {
-    for (const k of identityKeys({ name: g.name, state: g.state ?? g.st, zip: g.zip })) {
+    for (const k of identityKeys({ name: g.name, state: g.state ?? g.st, zip: g.zip }, initials)) {
       const j = seen.get(k);
       if (j == null) seen.set(k, i);
       else { const a = find(i), b = find(j); if (a !== b) parent[a] = b; }

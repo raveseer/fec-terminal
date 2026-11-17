@@ -1115,7 +1115,7 @@ function CandidateDonors({ onOpenDonor, seed }) {
     setView("donors");
     const d = await loadDonors();
     // first look at a committee: fetch its largest itemized receipts in the background
-    if (d?.coverage?.some((c) => !c.complete && c.available == null)) startPull(false);
+    if (d?.coverage?.some((c) => !c.complete && !c.bulkAt && c.available == null)) startPull(false);
   };
 
   const rows = useMemo(() => {
@@ -1239,7 +1239,8 @@ function CandidateDonors({ onOpenDonor, seed }) {
                 return (
                   <div key={`${c.committee}-${c.cycle}`} style={{ fontSize: 13, padding: "4px 0" }}>
                     <b style={{ fontWeight: 600 }}>{c.name}</b> · {Number(c.cycle) - 1}–{c.cycle}:{" "}
-                    {c.complete ? <span style={{ color: "var(--olive)" }}>all {fmtNum(c.stored)} itemized rows stored{c.via === "bulk" ? ` · FEC bulk file, loaded ${dateOf(c.asOf)}` : ""}</span>
+                    {c.complete ? <span style={{ color: "var(--olive)" }}>all {fmtNum(c.stored)} itemized rows stored</span>
+                      : c.bulkAt ? <span><span style={{ color: "var(--olive)" }}>every donor over $200 is stored</span> ({fmtNum(stored)} rows · FEC bulk file, loaded {dateOf(c.bulkAt)}){avail ? `; the committee itemized ${fmtNum(avail)} lines in all, the rest being smaller gifts` : ""}</span>
                       : avail != null ? <span>{fmtNum(stored)} of {fmtNum(avail)} itemized rows stored, largest first</span>
                       : <span className="sub">{fmtNum(stored)} rows stored so far — checking the FEC for the rest</span>}
                     {live && !live.done && avail ? <div className="tx-progress" style={{ maxWidth: 360 }}><i style={{ width: `${Math.min(100, (stored / avail) * 100)}%` }} /></div> : null}
@@ -1266,13 +1267,13 @@ function CandidateDonors({ onOpenDonor, seed }) {
               {bulk && !bulk.running && bulk.last && bulk.last.ok === false && <div className="tx-note warn">Bulk load failed: {bulk.last.error || bulk.last.summary}</div>}
               {!job?.running && !bulk?.running && incomplete.length > 0 && (
                 <div style={{ marginTop: 10, display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
-                  <button className="fec-btn" onClick={startBulk} title="Streams the FEC’s nationwide individual-contributions file for these periods and keeps the Tennessee rows">Get every donor from the FEC bulk file</button>
-                  {remaining > 0 && <button className="fec-btn ghost" onClick={() => startPull(true)}>or pull {fmtNum(remaining)} rows through the API</button>}
-                  <span className="sub">The bulk file takes minutes and also loads every Tennessee resident’s federal giving. The API route is about {fmtNum(Math.ceil(remaining / 100))} requests at 1,000 an hour.</span>
+                  {incomplete.some((c) => !c.bulkAt) && <button className="fec-btn" onClick={startBulk} title="Streams the FEC’s nationwide individual-contributions file for these periods and keeps the Tennessee rows">Load every donor over $200 from the FEC bulk file</button>}
+                  {remaining > 0 && <button className="fec-btn ghost" onClick={() => startPull(true)}>Pull the remaining {fmtNum(remaining)} lines through the API</button>}
+                  <span className="sub">The bulk file takes a few minutes per period and also loads every Tennessee resident’s federal giving. The API route adds the small gifts too: about {fmtNum(Math.ceil(remaining / 100))} requests at 1,000 an hour.</span>
                 </div>
               )}
               <div className="tx-note">
-                Itemized gifts only: federal donors appear once they pass $200 in a cycle, so small-dollar money is in the candidate’s totals but not here.
+                Itemized gifts only. Federal law requires itemizing donors past $200 in a cycle; committees often itemize smaller earmarked gifts too, and those only arrive through the API pull.
                 {data.mergedRecords > 0 && ` ${fmtNum(data.mergedRecords)} records were merged as the same donor written differently (same name once titles are dropped, or same first and last name at the same ZIP).`}
                 {data.conduits.count > 0 && ` ${data.conduits.names.join(" / ")} pass-through lines (${fmtUSD(data.conduits.total)}) are left out — that money is listed under the people who gave it.`}
                 {data.transfersDropped > 0 && ` ${fmtUSD(data.transfersDropped)} in transfers between the selected committees is left out so it isn’t counted twice.`}

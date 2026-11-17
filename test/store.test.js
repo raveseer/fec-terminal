@@ -83,7 +83,8 @@ test("donor identity: titles ignored, suffixes and middle names respected", () =
   const share = (a, b) => identityKeys(a).some((k) => identityKeys(b).includes(k));
   assert.ok(share({ name: "HASLAM, JAMES A. III", state: "TN" }, { name: "HASLAM, JAMES A. MR. III", state: "TN" }), "courtesy title only");
   assert.ok(!share({ name: "SMITH, JOHN", state: "TN" }, { name: "SMITH, JOHN A", state: "TN" }), "middle initial differs and no ZIP → not merged");
-  assert.ok(share({ name: "SMITH, JOHN", state: "TN", zip: "37660" }, { name: "SMITH, JOHN A", state: "TN", zip: "376601234" }), "same first name + same ZIP");
+  const one = new Map([["SMITH|JOHN||37660", new Set(["A"])]]);
+  assert.ok(identityKeys({ name: "SMITH, JOHN", state: "TN", zip: "37660" }, one).some((k) => identityKeys({ name: "SMITH, JOHN A", state: "TN", zip: "376601234" }, one).includes(k)), "same first name + same ZIP, one initial on file");
   assert.ok(!share({ name: "SMITH, JOHN JR", state: "TN", zip: "37660" }, { name: "SMITH, JOHN SR", state: "TN", zip: "37660" }), "father and son stay separate");
   assert.ok(!share({ name: "SMITH, JOHN", state: "TN", zip: "37660" }, { name: "SMITH, JOHN", state: "GA", zip: "30301" }), "same name, different place");
 });
@@ -100,4 +101,13 @@ test("donor identity: groups merge transitively and keep the largest record's fi
   assert.equal(smith.total, 650);
   assert.equal(smith.variants, 3);
   assert.equal(smith.name, "SMITH, JOHN", "largest member is the display record");
+});
+
+test("donor identity: conflicting middle initials at one ZIP stay separate", () => {
+  const out = mergeDonorGroups([
+    { name: "EUBANK, MICHAEL A.", st: "TN", zip: "37027", total: 300 },
+    { name: "EUBANK, MICHAEL C.", st: "TN", zip: "37027", total: 200 },
+    { name: "EUBANK, MICHAEL", st: "TN", zip: "37027", total: 100 },
+  ], { weight: (g) => g.total, combine: (a, b) => { a.total += b.total; } });
+  assert.equal(out.length, 3, "two different initials → the bare name cannot be assigned to either");
 });
