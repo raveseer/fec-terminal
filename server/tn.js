@@ -21,6 +21,7 @@ export const TN_YEARS = [
   { id: "214", label: "2018" }, { id: "226", label: "2018 (Senate 14)" }, { id: "222", label: "2017 (House 95)" },
   { id: "224", label: "2017 (Senate 17)" }, { id: "213", label: "2016" }, { id: "220", label: "2016 (19-3)" },
   { id: "218", label: "2015 (H14)" }, { id: "207", label: "2014" }, { id: "215", label: "2013 (House 91)" },
+  { id: "216", label: "2013 (aaa)" }, { id: "217", label: "2013 (bbb)" },
   { id: "200", label: "2012" }, { id: "210", label: "2012 (DA 2)" }, { id: "212", label: "2012 (DA 30)" },
   { id: "211", label: "2012 (PD 12)" }, { id: "205", label: "2011 (House 98)" }, { id: "206", label: "2011 (Senate 18)" },
   { id: "208", label: "2011 (Senate 6)" }, { id: "209", label: "2011 (Senate 6 Special)" }, { id: "4", label: "2010" },
@@ -29,6 +30,20 @@ export const TN_YEARS = [
   { id: "204", label: "2007 (Senate 30)" }, { id: "151", label: "2006" }, { id: "162", label: "2005 (House 22)" },
   { id: "160", label: "2005 (House 87)" }, { id: "161", label: "2005 (Senate 29)" }, { id: "159", label: "2005 (Senate 33)" },
   { id: "150", label: "2004" }, { id: "3", label: "2002" },
+];
+
+// Party filter ids on the TREF forms (verified against the live form, Nov 2026).
+export const TN_PARTIES = [
+  { id: "1", label: "Democrat" }, { id: "2", label: "Republican" }, { id: "3", label: "Independent" }, { id: "4", label: "Green" },
+];
+// "Report owed" filter (reportSelection, multi-select) shared by the C&E and report searches.
+export const TN_REPORT_TYPES = [
+  { id: "1", label: "1st Quarter" }, { id: "2", label: "2nd Quarter" }, { id: "3", label: "Pre-Primary" },
+  { id: "4", label: "3rd Quarter" }, { id: "5", label: "Pre-General" }, { id: "6", label: "4th Quarter" },
+  { id: "7", label: "Early Mid Year Supplemental" }, { id: "8", label: "Early Year End Supplemental" },
+  { id: "9", label: "Annual Mid Year Supplemental" }, { id: "10", label: "Annual Year End Supplemental" },
+  { id: "11", label: "Early Supplemental" }, { id: "12", label: "Supplemental" }, { id: "13", label: "Early Pre-Primary" },
+  { id: "14", label: "Post-Primary" }, { id: "15", label: "Early Pre-General" }, { id: "16", label: "Post-General" },
 ];
 
 export const TN_OFFICES = [
@@ -120,7 +135,17 @@ function stripTags(html) {
 }
 
 // ---- candidate / PAC search ----
-export async function searchCandidatesPacs({ name = "", officeId = "", yearId = "", type = "both" }) {
+// Options beyond the original name/office/year/type:
+//   districtId — TREF district id (see fetchDistricts; depends on the office)
+//   partyId    — TN_PARTIES id
+//   winner     — "primary" | "general" (the form's "Elections Won" radios)
+//   full       — request every result column the form offers (treasurer contact, primary/general
+//                result, committee affiliation, officers, created/closed, responsible individuals)
+// Name matching on TREF is "begins with", but `%` works as a wildcard (verified live: "health"
+// finds 1 PAC, "%health" finds 42) — callers wanting a contains-search pass "%term".
+// Every result also carries `entities`: the rows as structured objects for the local directory.
+export async function searchCandidatesPacs({ name = "", officeId = "", yearId = "", type = "both",
+  districtId = "", partyId = "", winner = "", full = false, maxPages = 40 }) {
   return polite(async () => {
     // 1. establish session
     const formPage = await tnFetch("/public/cpsearch.htm");
@@ -134,7 +159,7 @@ export async function searchCandidatesPacs({ name = "", officeId = "", yearId = 
       officeSelection: officeId,
       districtSelection: "",
       electionYearSelection: yearId,
-      partySelection: "",
+      partySelection: partyId,
       // result columns to include
       nameField: "true",
       contactField: "true",
@@ -145,6 +170,13 @@ export async function searchCandidatesPacs({ name = "", officeId = "", yearId = 
       treasurerNameField: "true",
       _continue: "Search",
     });
+    params.set("districtSelection", districtId);
+    if (winner === "primary") params.set("winner", "Y");
+    if (winner === "general") params.set("winner", "N");
+    if (full) {
+      for (const f of ["treasurerContactField", "primaryField", "generalField", "committeeField", "officersField",
+        "createdField", "closedField", "responsibleIndividualField"]) params.set(f, "true");
+    }
     const post = await tnFetch("/public/cpsearch.htm", {
       method: "POST", cookie, body: params.toString(), referer: `${TN_BASE}/public/cpsearch.htm`,
     });
@@ -164,7 +196,7 @@ export async function searchCandidatesPacs({ name = "", officeId = "", yearId = 
     // items found", which must NOT be treated as empty. Rescue regex covers DisplayTag's actual
     // "N items found" banner (nonzero) as well as "N results found" variants.
     if (/no results|(?<![\d,])0 items found|No records/i.test(html) && !/[1-9][\d,]* (?:items?|results?) found|One (?:item|result) found/i.test(html)) {
-      return { rows: [], headers: [], count: 0, source: "tn-tref" };
+      return { rows: [], headers: [], entities: [], count: 0, source: "tn-tref" };
     }
 
     // 4. DisplayTag CSV export on the same session (table id varies per render)
@@ -176,8 +208,20 @@ export async function searchCandidatesPacs({ name = "", officeId = "", yearId = 
         // Strategy 1 (primary): extract tnIds positionally from the HTML table rows.
         // Both the HTML table and the CSV are in the same sort order; this avoids
         // fragile name-matching and handles split First Name / Last Name columns.
-        const htmlTrIds = [...html.matchAll(/<tr[^>]*class="(?:odd|even)"[^>]*>([\s\S]*?)<\/tr>/gi)]
+        const trIds = (h) => [...h.matchAll(/<tr[^>]*class="(?:odd|even)"[^>]*>([\s\S]*?)<\/tr>/gi)]
           .map((m) => m[1].match(/replist\.htm\?id=(\d+)/)?.[1] || null);
+        const htmlTrIds = trIds(html);
+        // The HTML table shows 50 rows per page while the CSV holds every row, so ids for rows
+        // 51+ used to be lost (those entities then had no report list / ledger). Walk the
+        // DisplayTag pages (?d-<id>-p=N, same session) to collect ids for the whole result set.
+        const wantRows = rows.length - 1;
+        for (let pg = 2; htmlTrIds.length < wantRows && pg <= maxPages; pg++) {
+          await new Promise((r) => setTimeout(r, 350));
+          const more = await tnFetch(`/public/cpresults.htm?d-${exp[1]}-p=${pg}`, { cookie, referer: `${TN_BASE}/public/cpresults.htm` });
+          const ids = trIds(more.text);
+          if (!ids.length) break; // bounced or past the end — keep what we have
+          htmlTrIds.push(...ids);
+        }
 
         // Strategy 2 (fallback for rows beyond the HTML's first page): name-based map.
         const nameIds = {};
@@ -208,12 +252,14 @@ export async function searchCandidatesPacs({ name = "", officeId = "", yearId = 
           return nameIdx >= 0 ? (r[nameIdx] || "").trim().toUpperCase() : "";
         };
 
+        const outRows = rows.slice(1).map((r, i) => ({
+          cells: r,
+          tnId: htmlTrIds[i] || nameIds[rowName(r)] || null,
+        }));
         return {
           headers,
-          rows: rows.slice(1).map((r, i) => ({
-            cells: r,
-            tnId: htmlTrIds[i] || nameIds[rowName(r)] || null,
-          })),
+          rows: outRows,
+          entities: outRows.map((r) => entityFromRow(headers, r.cells, r.tnId, type)).filter(Boolean),
           count: rows.length - 1,
           source: "tn-tref",
         };
@@ -222,15 +268,38 @@ export async function searchCandidatesPacs({ name = "", officeId = "", yearId = 
 
     // fallback: parse the HTML table directly
     const tbl = html.match(/<table[^>]*id="results"[^>]*>([\s\S]*?)<\/table>/);
-    if (!tbl) return { rows: [], headers: [], count: 0, source: "tn-tref", note: "No results table found." };
+    if (!tbl) return { rows: [], headers: [], entities: [], count: 0, source: "tn-tref", note: "No results table found." };
     const headers = [...tbl[1].matchAll(/<th[^>]*>([\s\S]*?)<\/th>/g)].map((m) => stripTags(m[1]));
     const rows = [...tbl[1].matchAll(/<tr[^>]*class="(?:odd|even)"[^>]*>([\s\S]*?)<\/tr>/g)].map((m) => {
       const cells = [...m[1].matchAll(/<td[^>]*>([\s\S]*?)<\/td>/g)].map((c) => stripTags(c[1]));
       const idm = m[1].match(/replist\.htm\?id=(\d+)/);
       return { cells, tnId: idm ? idm[1] : null };
     });
-    return { headers, rows, count: rows.length, source: "tn-tref" };
+    return { headers, rows, entities: [], count: rows.length, source: "tn-tref" };
   });
+}
+
+// Structured view of one CSV result row (column names as TREF exports them, typos included —
+// "Party Affliation"). Returns null when there is no id or name to key on.
+export function entityFromRow(headers, cells, tnId, searchType = "both") {
+  if (!tnId) return null;
+  const get = (re) => { const i = headers.findIndex((h) => re.test(h)); return i >= 0 ? String(cells[i] || "").trim() : ""; };
+  const first = get(/^first\s*name$/i), last = get(/^last\s*name$/i), whole = get(/^name$/i);
+  const office = get(/^office/i);
+  const name = (first ? `${last}, ${first}` : (last || whole)).replace(/\s+/g, " ").trim();
+  if (!name) return null;
+  const kind = searchType === "pac" ? "pac" : searchType === "candidate" ? "candidate"
+    : (first || office || get(/^salutation$/i)) ? "candidate" : "pac";
+  return {
+    tnId: String(tnId), year: get(/^election\s*year$/i), kind, name,
+    party: get(/^party/i), office, district: get(/^district$/i),
+    address: [get(/^address\s*1$/i), get(/^address\s*2$/i)].filter(Boolean).join(", "),
+    city: get(/^city$/i), state: get(/^state$/i), zip: get(/^zip$/i), phone: get(/^phone$/i), email: get(/^email$/i),
+    treasurer: get(/^treasurer\s*name$/i), treasurerCity: get(/^treasurer\s*city$/i),
+    primaryResult: get(/^primary$/i), generalResult: get(/^general$/i),
+    committee: get(/^committee/i), officers: get(/^officers$/i), responsible: get(/^responsible/i),
+    created: get(/^created$/i), closed: get(/^closed$/i),
+  };
 }
 
 // A stateful session helper: TREF (Tomcat) can rotate JSESSIONID on POST (session-fixation
@@ -262,6 +331,21 @@ function tnSession() {
   return { step, warm, get cookie() { return cookie; } };
 }
 
+// One warm session is kept and reused for report lists and report details. Warming costs three
+// requests (form GET, search POST, results GET); doing that before EVERY report meant four
+// requests per report — ~100 requests to read a 24-report ledger. Reused, it is one request per
+// report. If TREF bounces a request the session is dropped, re-warmed once and the request retried.
+const SESSION_TTL_MS = Number(process.env.TN_SESSION_TTL_MS || 8 * 60_000);
+let sharedSession = null; // { s, at }
+async function warmSession(seed = "") {
+  if (sharedSession && Date.now() - sharedSession.at < SESSION_TTL_MS) return sharedSession.s;
+  const s = tnSession();
+  await s.warm(seed);
+  sharedSession = { s, at: Date.now() };
+  return s;
+}
+const dropSession = () => { sharedSession = null; };
+
 const looksLikeTnHome = (text) =>
   /Search for Candidates and PACs|Search the Online Campaign Finance Database/i.test(text) &&
   !/Report Name|Beginning Balance|Total Monetary/i.test(text);
@@ -271,14 +355,14 @@ const looksLikeTnHome = (text) =>
 // session (seeded with the owner's name), then request replist; retry once if still bounced.
 export async function listReports(tnId, owner = "") {
   return polite(async () => {
-    const s = tnSession();
-    await s.warm(owner);
+    let s = await warmSession(owner);
     const getReplist = () => s.step(
       `/public/replist.htm?id=${encodeURIComponent(tnId)}&owner=${encodeURIComponent(owner)}`,
       { referer: `${TN_BASE}/public/cpresults.htm` },
     );
     let page = await getReplist();
-    if (looksLikeTnHome(page.text)) { await s.warm(owner); page = await getReplist(); }
+    if (looksLikeTnHome(page.text)) { dropSession(); s = await warmSession(owner); page = await getReplist(); }
+    if (looksLikeTnHome(page.text)) dropSession();
 
     const html = page.text;
     if (looksLikeTnHome(html)) {
@@ -319,15 +403,22 @@ function parseDollar(str) {
 export async function fetchReportDetail(reportId) {
   return polite(async () => {
     // report_full needs a warm session (its entity context comes from URL params, not session state).
-    const s = tnSession();
-    await s.warm();
     // Try /search/pub/ first (confirmed URL pattern from TREF UI), fall back to /public/
-    let page = await s.step(`/search/pub/report_full.htm?reportId=${encodeURIComponent(reportId)}`, { referer: `${TN_BASE}/public/replist.htm` });
+    const attempt = async (s) => {
+      let pg = await s.step(`/search/pub/report_full.htm?reportId=${encodeURIComponent(reportId)}`, { referer: `${TN_BASE}/public/replist.htm` });
+      if (pg.status !== 200 || looksLikeTnHome(pg.text)) {
+        pg = await s.step(`/public/report_full.htm?reportId=${encodeURIComponent(reportId)}`, { referer: `${TN_BASE}/public/replist.htm` });
+      }
+      return pg;
+    };
+    let page = await attempt(await warmSession());
     if (page.status !== 200 || looksLikeTnHome(page.text)) {
-      page = await s.step(`/public/report_full.htm?reportId=${encodeURIComponent(reportId)}`, { referer: `${TN_BASE}/public/replist.htm` });
+      // shared session went stale (or TREF rotated it) — one fresh session, one retry
+      dropSession();
+      page = await attempt(await warmSession());
     }
-    if (page.status !== 200) throw new Error(`TREF returned HTTP ${page.status} for reportId ${reportId}`);
-    if (looksLikeTnHome(page.text)) throw new Error(`TREF bounced reportId ${reportId} to its search home — session could not be established.`);
+    if (page.status !== 200) { dropSession(); throw new Error(`TREF returned HTTP ${page.status} for reportId ${reportId}`); }
+    if (looksLikeTnHome(page.text)) { dropSession(); throw new Error(`TREF bounced reportId ${reportId} to its search home — session could not be established.`); }
     return parseReportHtml(page.text, reportId);
   });
 }
@@ -472,33 +563,61 @@ function parseReportHtml(html, reportId) {
 //   - recipientName:   contributions TO this candidate/PAC (who funds them)
 //   - contributorName: contributions FROM this name (which candidates a PAC/person funds)
 //   - candName:        expenditures BY this candidate/PAC (vendors, independent spending)
-// electionYearId is a TREF internal ID (TN_YEARS); reportYear is a literal year — both required by the form.
-export async function searchMoney({ searchType, recipientName = "", contributorName = "", candName = "", electionYearId, reportYear }) {
+// reportYear (a literal year) is REQUIRED by the form. electionYearId (TN_YEARS id) is OPTIONAL —
+// verified live Nov 2026: a search with only a report year returns rows for every election cycle,
+// including special elections; a search with only an election year is rejected (HTTP 500).
+// Every other form field is exposed too, so any TREF search path can be driven from here:
+//   employer / occupation / zipCode          — contributor filters (contributions)
+//   vendorName / vendorZipCode / purpose     — payee filters (expenditures)
+//   typeOf        — "all" | "monetary" | "inkind" | "independent"
+//   amountOp      — "equal" | "greater" | "less", with amount (dollars, may include cents)
+//   reportTypes   — array of TN_REPORT_TYPES ids ("report owed")
+//   toType        — "both" | "candidate" | "pac" (recipient kind)
+//   from / to     — which contributor / recipient classes to include (all on by default)
+// Names are "begins with" unless prefixed with % (wildcard).
+export async function searchMoney({ searchType, recipientName = "", contributorName = "", candName = "", electionYearId = "", reportYear,
+  employer = "", occupation = "", zipCode = "", vendorName = "", vendorZipCode = "", purpose = "",
+  typeOf = "all", amountOp = "equal", amount = "", reportTypes = [], toType = "both",
+  from = { candidate: true, pac: true, individual: true, organization: true },
+  to = { candidate: true, pac: true, other: true } }) {
   return polite(async () => {
     const formPage = await tnFetch("/public/cesearch.htm");
     let cookie = extractSession(formPage.setCookie);
     if (!cookie) throw new Error("TN site did not issue a session cookie — site may be down or has changed.");
 
+    let amountDollars = "", amountCents = "";
+    if (amount !== "" && amount != null && Number.isFinite(Number(amount))) {
+      const cents = Math.round(Math.abs(Number(amount)) * 100);
+      amountDollars = String(Math.floor(cents / 100));
+      amountCents = String(cents % 100).padStart(2, "0");
+    }
     const params = new URLSearchParams({
       searchType,
-      toType: "both",
-      // "*From" / "*To" required checkbox groups — include everything
-      fromCandidate: "true", fromPAC: "true", fromIndividual: "true", fromOrganization: "true",
-      toCandidate: "true", toPac: "true", toOther: "true",
-      electionYearSelection: String(electionYearId),
+      toType: ["candidate", "pac", "both"].includes(toType) ? toType : "both",
+      electionYearSelection: String(electionYearId || ""),
       yearSelection: String(reportYear),
       recipientName, contributorName, candName,
-      employer: "", occupation: "", zipCode: "",
-      vendorName: "", vendorZipCode: "", purpose: "",
-      typeOf: "all",
-      amountSelection: "equal", amountDollars: "", amountCents: "",
+      employer, occupation, zipCode,
+      vendorName, vendorZipCode, purpose,
+      typeOf: ["all", "monetary", "inkind", "independent"].includes(typeOf) ? typeOf : "all",
+      amountSelection: ["equal", "greater", "less"].includes(amountOp) ? amountOp : "equal", amountDollars, amountCents,
       // result columns
-      typeField: "true", amountField: "true", dateField: "true", electionYearField: "true",
+      typeField: "true", adjustmentField: "true", soField: "true",
+      amountField: "true", dateField: "true", electionYearField: "true",
       reportNameField: "true", recipientNameField: "true", contributorNameField: "true",
       contributorAddressField: "true", contributorOccupationField: "true", contributorEmployerField: "true",
       descriptionField: "true", candidatePACNameField: "true", vendorNameField: "true",
       vendorAddressField: "true", purposeField: "true", candidateForField: "true",
     });
+    // "*From" / "*To" checkbox groups (unchecked boxes are simply absent from the POST)
+    if (from?.candidate !== false) params.set("fromCandidate", "true");
+    if (from?.pac !== false) params.set("fromPAC", "true");
+    if (from?.individual !== false) params.set("fromIndividual", "true");
+    if (from?.organization !== false) params.set("fromOrganization", "true");
+    if (to?.candidate !== false) params.set("toCandidate", "true");
+    if (to?.pac !== false) params.set("toPac", "true");
+    if (to?.other !== false) params.set("toOther", "true");
+    for (const rt of reportTypes || []) if (/^\d{1,2}$/.test(String(rt))) params.append("reportSelection", String(rt));
     // the form carries both a hidden _continue=Continue and the submit button _continue=Search
     params.append("_continue", "Continue");
     params.append("_continue", "Search");
@@ -548,4 +667,102 @@ export async function tnHealth() {
   } catch (e) {
     return { status: "down", error: e.message };
   }
+}
+
+// ---- report search (repsearch.htm): every report filed, by type / year / office / district / party ----
+// The third TREF search path. Unlike the candidate search this finds FILINGS — e.g. "every 3rd
+// Quarter 2026 report from House candidates" — and each row links straight to the report detail.
+// reportYear is required by the form. Results are read from the HTML pages (the CSV export has no
+// report ids), 50 rows per page, up to maxPages.
+export async function searchReports({ name = "", forAll = "both", officeId = "", districtId = "", yearId = "",
+  reportYear, partyId = "", reportTypes = [], maxPages = 12 }) {
+  return polite(async () => {
+    const formPage = await tnFetch("/public/repsearch.htm");
+    let cookie = extractSession(formPage.setCookie);
+    if (!cookie) throw new Error("TN site did not issue a session cookie — site may be down or has changed.");
+    const params = new URLSearchParams({
+      forAll: ["candidate", "pac", "both"].includes(forAll) ? forAll : "both",
+      name, officeSelection: officeId, districtSelection: districtId,
+      electionYearSelection: yearId, yearSelection: String(reportYear), partySelection: partyId,
+      reportField: "on", nameField: "on", contactField: "on", partyField: "on",
+    });
+    for (const rt of reportTypes || []) if (/^\d{1,2}$/.test(String(rt))) params.append("reportSelection", String(rt));
+    params.append("_continue", "Continue");
+    params.append("_continue", "Search");
+    const post = await tnFetch("/public/repsearch.htm", { method: "POST", cookie, body: params.toString(), referer: `${TN_BASE}/public/repsearch.htm` });
+    if (![200, 302, 303].includes(post.status)) throw new Error(`TN report search POST returned HTTP ${post.status}`);
+    cookie = extractSession(post.setCookie) || cookie;
+    const first = await tnFetch("/public/represults.htm", { cookie, referer: `${TN_BASE}/public/repsearch.htm` });
+    cookie = extractSession(first.setCookie) || cookie;
+    let html = first.text;
+    if (isEmptyResult(html)) return { rows: [], count: 0, source: "tn-tref" };
+
+    const total = (() => {
+      const m = html.match(/([\d,]+) (?:items?|results?) found/i);
+      if (m) return Number(m[1].replace(/,/g, ""));
+      return /One (?:item|result) found/i.test(html) ? 1 : null;
+    })();
+    const parsePage = (h) => {
+      const tbl = h.match(/<table[^>]*id="results"[^>]*>([\s\S]*?)<\/table>/) || h.match(/<table[^>]*>([\s\S]*?)<\/table>/);
+      if (!tbl) return [];
+      return [...tbl[1].matchAll(/<tr[^>]*class="(?:odd|even)"[^>]*>([\s\S]*?)<\/tr>/g)].map((m) => {
+        const cells = [...m[1].matchAll(/<td[^>]*>([\s\S]*?)<\/td>/g)].map((c) => stripTags(c[1]));
+        const reportId = m[1].match(/reportId=(\d+)/i)?.[1] || null;
+        return { reportId, reportName: cells[0] || "", name: cells[1] || "", contact: cells[2] || "", party: cells[3] || "" };
+      }).filter((r) => r.reportId || r.name);
+    };
+    const rows = parsePage(html);
+    const tableId = html.match(/represults\.htm\?d-(\d+)-/)?.[1];
+    let pg = 2;
+    while (tableId && total && rows.length < total && pg <= maxPages) {
+      await new Promise((r) => setTimeout(r, 350));
+      const more = await tnFetch(`/public/represults.htm?d-${tableId}-p=${pg}`, { cookie, referer: `${TN_BASE}/public/represults.htm` });
+      const got = parsePage(more.text);
+      if (!got.length) break;
+      rows.push(...got);
+      pg++;
+    }
+    return { rows, count: total ?? rows.length, capped: total != null && rows.length < total, source: "tn-tref" };
+  });
+}
+
+// "(?<![\d,])0" — a bare "0 items found" only (see searchCandidatesPacs for the rationale).
+function isEmptyResult(html) {
+  return /no results|(?<![\d,])0 items found|No records|Nothing found/i.test(html)
+    && !/[1-9][\d,]* (?:items?|results?) found|One (?:item|result) found/i.test(html);
+}
+
+// ---- districts for an office (the form loads these by AJAX: POST districts.htm?officeId=N) ----
+export async function fetchDistricts(officeId) {
+  return polite(async () => {
+    const r = await tnFetch(`/public/districts.htm?officeId=${encodeURIComponent(officeId)}`, { method: "POST", referer: `${TN_BASE}/public/cpsearch.htm` });
+    if (r.status !== 200) throw new Error(`TREF districts lookup returned HTTP ${r.status}`);
+    let data;
+    try { data = JSON.parse(r.text); } catch { throw new Error("TREF districts lookup did not return JSON — the site may have changed."); }
+    return (data.districts || []).map((d) => ({ id: String(d.id), label: String(d.name) }));
+  });
+}
+
+// ---- live form metadata: election years / offices / parties / report years straight from the
+// search forms, so new cycles and special elections appear without editing TN_YEARS by hand. ----
+export async function fetchFormMeta() {
+  return polite(async () => {
+    const opts = (html, selectName) => {
+      const sel = html.match(new RegExp(`<select[^>]*name="${selectName}"[^>]*>([\\s\\S]*?)<\\/select>`, "i"));
+      if (!sel) return [];
+      return [...sel[1].matchAll(/<option[^>]*value="([^"]*)"[^>]*>([\s\S]*?)<\/option>/gi)]
+        .map((m) => ({ id: m[1].trim(), label: stripTags(m[2]) }))
+        .filter((o) => o.id);
+    };
+    const cp = await tnFetch("/public/cpsearch.htm");
+    const years = opts(cp.text, "electionYearSelection");
+    const offices = opts(cp.text, "officeSelection");
+    const parties = opts(cp.text, "partySelection");
+    if (!years.length || !offices.length) throw new Error("TREF search form did not contain the expected selects — layout may have changed.");
+    await new Promise((r) => setTimeout(r, 350));
+    const ce = await tnFetch("/public/cesearch.htm");
+    const reportYears = opts(ce.text, "yearSelection").map((o) => o.id).filter((y) => /^\d{4}$/.test(y));
+    const reportTypes = opts(ce.text, "reportSelection");
+    return { years, offices, parties, reportYears, reportTypes };
+  });
 }

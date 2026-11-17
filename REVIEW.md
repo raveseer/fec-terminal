@@ -159,6 +159,25 @@ low‑quality models.
 
 ---
 
+## 4b. Connections & persistence audit (July 11, 2026)
+
+Every external feed, its cache semantics, and what persists permanently:
+
+| Feed | Freshness mechanism | Permanent storage |
+|---|---|---|
+| FEC API (proxy `/api/fec/*`) | 6h TTL cache, `x-cached-at` surfaced, `_refresh=1` bypass | Schedule A/B itemized → `contributions`; Schedule E → `contributions` (kind `ie`, never in contribution sums); candidates/committees/totals/elections → `fec_candidate` / `fec_committee` / `candidate_totals` (totals keyed by coverage period = filing history) |
+| FEC bulk files | 20h mtime window + `--fresh`; Admin shows FEC `Last-Modified` vs local copy ("new data available" is measured) | masters + PAC→candidate/PAC→PAC → same permanent tables; SUB_ID dedupes vs API rows |
+| TN TREF scraper | 1d TTL, 5min negative-cache on bounces/zero-results, `_refresh=1` | report lists/details verbatim (`tn_report_*`), itemizations → `contributions`. **Deliberate non-ingest:** cesearch rows (would double-count the same gifts already parsed from reports) |
+| Ollama narratives | prompt-hash invalidation + ↺ Refresh | `ai_summary` (addressable, permanent) |
+| Web search / wiki / news | per-call, embedded in agent answers | persists inside stored ask/dossier payloads |
+| Org enrichment (lobbying/nonprofit/contracts) | TTL cache only | not persisted (recomputable; low value) — accepted |
+| Congress members / districts | on-disk files + admin refresh | disk |
+
+Failure posture everywhere: loud errors surfaced in UI status, additive-only writes (a failed
+refresh can never corrupt or erase stored history). Admin panel is now the single status hub:
+Connections grid (FEC key, TREF, web search), bulk-source freshness table, import job + schedule,
+models, system stats.
+
 ## 5. Quick wins checklist
 
 - [ ] Split `App.jsx` into modules (no behavior change).
@@ -166,3 +185,38 @@ low‑quality models.
 - [ ] Remove unused `TTL.ai`; clear stale `dist/assets/` bundles.
 - [ ] Add quarter‑over‑quarter sparklines to race rows (roadmap A).
 - [ ] Persist nightly race snapshots → change alerts (roadmap D).
+
+---
+
+## 6. November 2026 pass (v4.1.0)
+
+**Storage & web calls.** Measured on the live 1.77M-row store before/after: donor typeahead
+616 ms → 9 ms, quick-find 564 → 18 ms, Donors-tab counters 1.9 s → 0.17 s (4 ms repeat),
+employer lookup 4.0 s → 0.5 s; TN district GeoJSON 4.7 MB → 1.7 MB on the wire; JS bundle
+473 KB → 144 KB. How: `donor_names` dimension for name search, version-aware memoization
+(`PRAGMA data_version` + a write counter), one-scan employer rollups, index-covered counts,
+prepared-statement cache, WAL/mmap/page-cache pragmas, compression, static caching. Upstream:
+single cached FEC gateway (shared keys, cycle-aware TTLs, coalescing, stale-if-error, 429
+back-off); cached TREF C&E search with 30-day retention for closed years; shared warm TREF
+session (4 requests per report → 1); the TN results table no longer scrapes a report list per
+row for big result sets (`/api/tn/reports?live=0`).
+
+**Tennessee coverage.** Verified against the live TREF forms (field names in `server/tn.js`):
+`%` works as a wildcard (one contains-search replaces the four-prefix fan-out — "health" 1 PAC
+vs "%health" 42); a C&E search needs only a report year, not an election year; result ids are
+now collected for every page (rows 51+ used to lose their id); district/party/winner filters;
+all result columns; the report search and the districts endpoint; election years are read from
+the live form (fixes the hand-synced list flagged in §4). New: Directory, Money search, Filings,
+Federal races, Federal dollars — see README.
+
+**Look & feel.** New token-based stylesheet in `src/styles.js` (dark + light, follows the OS,
+toggle in the header), IBM Plex Sans / Sans Condensed / Mono bundled locally, sticky app bar with
+navigation, Donors and Tennessee stay mounted between tab switches.
+
+**Not done / candidates for next pass.**
+- `src/App.jsx` is still one ~8,300-line file; new code went into `Tennessee.jsx`, `lib.js`,
+  `styles.js`, `server/tnx.js`. The split in §2 is still the highest-leverage refactor.
+- ~650 inline `style={{}}` blocks in App.jsx still carry small uppercase label styling.
+- Tennessee sources not covered: Ethics Commission lobbyist registrations, county/municipal
+  campaign filings (each county election commission publishes separately), the state checkbook.
+- A scheduled nightly "sync current cycles" + TREF new-filing alerts would pair with §3-D.

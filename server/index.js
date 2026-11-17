@@ -4,13 +4,22 @@ import fs from "node:fs";
 import path from "node:path";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { AsyncLocalStorage } from "node:async_hooks";
+import compression from "compression";
 import { searchCandidatesPacs, listReports, fetchReportDetail, searchMoney, tnHealth, TN_YEARS, TN_OFFICES, REPORT_PARSER_V } from "./tn.js";
-import { cacheGet, cacheSet, cacheGetWithAge, cacheCount, cacheFlush, settingGet, settingSet, persistent,
+import { registerTnExplorer } from "./tnx.js";
+import { cacheGet, cacheSet, cacheGetWithAge, cacheGetStale, cacheCount, cacheFlush, settingGet, settingSet, persistent,
+         dbStorageStats, dbCompact, tnEntityUpsertMany,
          tnReportListGet, tnReportListSave, tnReportDetailGet, tnReportDetailSave, tnReportCount,
          aiSummaryGet, aiSummarySave, aiSummaryCount, aiSummaryClear,
          tnSearchSave, tnSearchList,
          contribUpsertMany, contribDeleteBySubIdPrefix, contribDonorGroups, contribDonorNamePool, contribDonorRows,
          contribRecipientRows, contribStats, contribEdgeRows, contribFieldAgg,
+         fecCommitteeUpsertMany, fecCandidateUpsertMany, candidateTotalsUpsertMany, fecRefStats, fecCommitteeGet,
+         tnWatchAdd, tnWatchRemove, tnWatchHas, tnWatchList, tnWatchMarkSeen,
+         candWatchAdd, candWatchRemove, candWatchHas, candWatchRows, candWatchMarkSeen,
+         fecMasterFind, candidateTotalsList, candidateTotalsForMany, dbBackup,
+         alertAdd, alertList, ssAdd, ssRemove, ssList, ssMarkSeen, ieNewSince, donorNewRecipSince, fieldNewSince,
          watchAdd, watchRemove, watchHas, watchList, watchMarkSeen, probeGet, probeSet } from "./db.js";
 import { webSearch, searchConfigured, searchProvider } from "./search.js";
 import { looksLikeNonAnswer, cleanAnswer, usableAnswerOrEmpty } from "./deferral.js";
@@ -18,7 +27,24 @@ import { looksLikeNonAnswer, cleanAnswer, usableAnswerOrEmpty } from "./deferral
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
 app.disable("x-powered-by");
+// gzip/brotli for everything compressible: the JS bundle (≈480 KB → ≈140 KB), district GeoJSON
+// (TN alone is 4.7 MB raw) and the large JSON API payloads. Streamed NDJSON (Ask AI) opts out —
+// buffering it would hold back the live "what I'm checking" trace.
+app.use(compression({
+  threshold: 1024,
+  filter: (req, res) => {
+    if (/ndjson|event-stream/i.test(String(res.getHeader("Content-Type") || ""))) return false;
+    if (/^\/api\/(ask|donors\/ask|donors\/research|dossier|tn\/dossier)\b/.test(req.path)) return false;
+    return compression.filter(req, res);
+  },
+}));
 app.use(express.json({ limit: "4mb" }));
+
+// Request-scoped "the user pressed ↺ Refresh" flag, readable by the cached upstream wrappers
+// (moneySearch etc.) without threading a parameter through every call site.
+const refreshCtx = new AsyncLocalStorage();
+app.use("/api", (req, _res, next) => refreshCtx.run({ force: req.query?._refresh === "1" }, next));
+const wantsRefresh = () => Boolean(refreshCtx.getStore()?.force);
 
 // body-parser errors (malformed JSON, oversized payloads) -> JSON, not an HTML stack page
 app.use((err, _req, res, next) => {
@@ -95,18 +121,90 @@ const ALLOWED = [
   /^committees\/?$/,
 ];
 
-// server-side FEC fetch with the same cache (used by donor profiling)
-async function fecFetch(fecPath, params = {}) {
+// ---- one cached gateway for every FEC call (the browser proxy AND server-side fetches) ----
+//  * one cache key per logical request: path + sorted params, api key excluded — so the proxy and
+//    the server-side tools share entries, and changing FEC_API_KEY doesn't orphan the cache
+//  * closed election cycles get a much longer TTL (their filings are final bar rare amendments)
+//  * identical requests already in flight are coalesced into a single upstream call
+//  * stale-if-error: when the FEC is unreachable, erroring or rate-limiting, the last good copy is
+//    served (flagged stale) instead of failing
+//  * after a 429 the gateway stops calling the FEC until the Retry-After window has passed
+const CURRENT_CYCLE = (() => { const y = new Date().getFullYear(); return y % 2 ? y + 1 : y; })();
+function fecTtl(qs) {
+  const cyc = Number(qs.get("cycle") || qs.get("two_year_transaction_period") || qs.get("election_year") || 0);
+  if (cyc && cyc <= CURRENT_CYCLE - 4) return Math.max(TTL.fec, 14 * DAY);
+  if (cyc && cyc < CURRENT_CYCLE) return Math.max(TTL.fec, 3 * DAY);
+  return TTL.fec;
+}
+function fecCacheKey(fecPath, qs) {
+  const pairs = [...qs.entries()].filter(([k]) => k !== "api_key" && k !== "_refresh")
+    .sort((a, b) => (a[0] === b[0] ? String(a[1]).localeCompare(String(b[1])) : a[0].localeCompare(b[0])));
+  return `fec:${fecPath.replace(/\/+$/, "")}?${new URLSearchParams(pairs)}`;
+}
+const fecInflight = new Map(); // cache key -> Promise<{status, ok, body, retryAfter}>
+let fecBlockedUntil = 0;       // epoch ms; set by a 429
+const fecStats = { hits: 0, misses: 0, stale: 0, coalesced: 0, upstreamErrors: 0, since: Date.now() };
+
+// Returns { status, body, cache: "hit" | "miss" | "stale", cachedAt, note? }. Throws only when the
+// upstream call failed AND there is no stored copy to fall back on.
+async function fecGet(fecPath, params, { fresh = false } = {}) {
   const qs = new URLSearchParams(params);
-  qs.set("api_key", FEC_API_KEY);
-  const url = `${FEC_BASE}/${fecPath}?${qs}`;
-  const cached = cacheGet(url);
-  if (cached) return cached.body;
-  const r = await fetch(url, { headers: { accept: "application/json" }, signal: AbortSignal.timeout(FEC_FETCH_TIMEOUT_MS) });
-  const body = await r.json().catch(() => null);
-  if (!r.ok) throw new Error(body?.error?.message || `FEC HTTP ${r.status}`);
-  cacheSet(url, { status: r.status, body }, TTL.fec);
-  return body;
+  qs.delete("api_key"); qs.delete("_refresh");
+  const key = fecCacheKey(fecPath, qs);
+  if (!fresh) {
+    const hit = cacheGetWithAge(key);
+    if (hit) { fecStats.hits++; return { status: hit.value.status, body: hit.value.body, cache: "hit", cachedAt: hit.createdAt }; }
+  }
+  const staleOr = (reason, fallback) => {
+    const stale = cacheGetStale(key);
+    if (stale) {
+      fecStats.stale++;
+      return { status: stale.value.status, body: stale.value.body, cache: "stale", cachedAt: stale.createdAt, note: reason };
+    }
+    return fallback();
+  };
+  if (Date.now() < fecBlockedUntil) {
+    const secs = Math.ceil((fecBlockedUntil - Date.now()) / 1000);
+    const msg = `FEC rate limit reached — retrying in ${secs}s`;
+    return staleOr(msg, () => ({ status: 429, body: { error: { message: `${msg}. ${FEC_API_KEY === "DEMO_KEY" ? "DEMO_KEY allows ~30 requests/hour; set FEC_API_KEY for 1,000/hour." : ""}`.trim() } }, cache: "miss", cachedAt: null }));
+  }
+  let pending = fecInflight.get(key);
+  if (pending) fecStats.coalesced++;
+  else {
+    const up = new URLSearchParams(qs);
+    up.set("api_key", FEC_API_KEY);
+    pending = (async () => {
+      const r = await fetch(`${FEC_BASE}/${fecPath}?${up}`, { headers: { accept: "application/json" }, signal: AbortSignal.timeout(FEC_FETCH_TIMEOUT_MS) });
+      const body = await r.json().catch(() => null);
+      return { status: r.status, ok: r.ok, body, retryAfter: Number(r.headers.get("retry-after")) || 0 };
+    })().finally(() => fecInflight.delete(key));
+    fecInflight.set(key, pending);
+  }
+  let up;
+  try { up = await pending; }
+  catch (e) {
+    fecStats.upstreamErrors++;
+    return staleOr(`FEC unreachable (${e.message})`, () => { throw new Error(`Upstream fetch failed: ${e.message}`); });
+  }
+  if (up.ok && up.body) {
+    fecStats.misses++;
+    cacheSet(key, { status: up.status, body: up.body }, fecTtl(qs));
+    return { status: up.status, body: up.body, cache: "miss", cachedAt: null };
+  }
+  fecStats.upstreamErrors++;
+  if (up.status === 429) fecBlockedUntil = Date.now() + Math.min(Math.max(up.retryAfter || 60, 15), 3600) * 1000;
+  const errBody = up.body || { error: { message: "Non-JSON response from FEC" } };
+  if (up.status === 429 || up.status >= 500) {
+    return staleOr(`FEC returned HTTP ${up.status}`, () => ({ status: up.status, body: errBody, cache: "miss", cachedAt: null }));
+  }
+  return { status: up.status, body: errBody, cache: "miss", cachedAt: null };
+}
+
+// server-side FEC fetch through the gateway (used by donor profiling, top-ups, the agents)
+async function fecFetch(fecPath, params = {}) {
+  const r = await fecGet(fecPath, params);
+  if (r.status >= 400) throw new Error(r.body?.error?.message || r.body?.message || `FEC HTTP ${r.status}`);
+  return r.body;
 }
 
 // ---- donor-ledger helpers (permanent contributions ledger, see db.js) ----
@@ -166,6 +264,104 @@ function ingestScheduleB(results) {
     }
     if (rows.length) contribUpsertMany(rows);
   } catch (e) { console.warn("[ingestScheduleB]", e.message); }
+}
+
+// ---- permanent candidate/committee capture ----
+// Everything the app ever pulls about a candidate persists: candidate objects, committee
+// objects, and financial totals (keyed by coverage period → filing-to-filing history).
+// Best-effort by design, same contract as ingestScheduleA/B — never break a live response.
+
+function ingestCandidateObjects(results) {
+  try {
+    const rows = [];
+    for (const c of results || []) {
+      const candId = c.candidate_id;
+      if (!candId) continue;
+      rows.push({
+        candId, name: c.name || c.candidate_name, party: c.party_full || c.party,
+        office: c.office, state: c.state, district: c.district,
+        pcc: c.principal_committees?.[0]?.committee_id || c.candidate_pcc_id,
+        incumbentChallenge: c.incumbent_challenge || (c.incumbent_challenge_full ? c.incumbent_challenge_full[0] : null),
+        status: c.candidate_status,
+        lastCycle: Array.isArray(c.election_years) ? Math.max(...c.election_years) : (c.election_year ?? null),
+      });
+    }
+    if (rows.length) fecCandidateUpsertMany(rows);
+  } catch (e) { console.warn("[ingestCandidateObjects]", e.message); }
+}
+
+function ingestCommitteeObjects(results) {
+  try {
+    const rows = [];
+    for (const c of results || []) {
+      if (!c?.committee_id) continue;
+      rows.push({
+        cmteId: c.committee_id, name: c.name, type: c.committee_type, designation: c.designation,
+        party: c.party_full || c.party, state: c.state, connectedOrg: c.organization_type_full || c.connected_organization_name,
+        candId: Array.isArray(c.candidate_ids) ? c.candidate_ids[0] : null,
+        lastCycle: Array.isArray(c.cycles) ? Math.max(...c.cycles) : null,
+      });
+    }
+    if (rows.length) fecCommitteeUpsertMany(rows);
+  } catch (e) { console.warn("[ingestCommitteeObjects]", e.message); }
+}
+
+function ingestCandidateTotals(results) {
+  try {
+    const rows = [];
+    for (const t of results || []) {
+      if (!t?.candidate_id) continue;
+      rows.push({
+        candId: t.candidate_id, cycle: t.cycle ?? t.election_year, coverageEnd: normDate(t.coverage_end_date),
+        receipts: t.receipts, disbursements: t.disbursements,
+        cashOnHand: t.cash_on_hand_end_period ?? t.last_cash_on_hand_end_period,
+        debts: t.debts_owed_by_committee ?? t.last_debts_owed_by_committee, source: "totals",
+      });
+    }
+    if (rows.length) candidateTotalsUpsertMany(rows);
+  } catch (e) { console.warn("[ingestCandidateTotals]", e.message); }
+}
+
+// /elections/ standings rows carry both identity and cycle totals — capture both.
+function ingestElectionRows(results, cycle) {
+  try {
+    const cands = [], totals = [];
+    for (const r of results || []) {
+      if (!r?.candidate_id) continue;
+      cands.push({ candId: r.candidate_id, name: r.candidate_name, party: r.party_full,
+        pcc: r.candidate_pcc_id, incumbentChallenge: r.incumbent_challenge_full ? r.incumbent_challenge_full[0] : null,
+        lastCycle: cycle ?? null });
+      totals.push({ candId: r.candidate_id, cycle: cycle ?? r.election_year ?? "",
+        coverageEnd: normDate(r.coverage_end_date), receipts: r.total_receipts,
+        disbursements: r.total_disbursements, cashOnHand: r.cash_on_hand_end_period, source: "elections" });
+    }
+    if (cands.length) fecCandidateUpsertMany(cands);
+    if (totals.length) candidateTotalsUpsertMany(totals.filter((t) => t.cycle));
+  } catch (e) { console.warn("[ingestElectionRows]", e.message); }
+}
+
+// Feed FEC Schedule E (independent expenditures) into the permanent ledger — kind "ie" so no
+// existing aggregation sees them (everything filters kind='contribution'|'disbursement'
+// explicitly; FOR/AGAINST money must never blend into contribution totals). donorKey = the
+// SPENDING committee, candidateId = the target; report carries FOR/AGAINST + description.
+function ingestScheduleE(results) {
+  try {
+    const rows = [];
+    for (const r of results || []) {
+      if (!r?.sub_id || !r?.candidate_id) continue;
+      rows.push({
+        source: "fec", subId: String(r.sub_id), kind: "ie",
+        donorKey: normalizeDonorKey(r.committee_name || r.committee_id || "IE SPENDER", ""),
+        donorName: r.committee_name || r.committee_id, entityType: "COM",
+        recipientId: r.committee_id, recipientName: r.committee_name,
+        candidateId: r.candidate_id,
+        cycle: r.two_year_transaction_period ?? r.report_year, date: normDate(r.expenditure_date),
+        amount: r.expenditure_amount,
+        report: `IE ${r.support_oppose_indicator === "S" ? "FOR" : "AGAINST"} ${r.candidate_name || r.candidate_id}${r.expenditure_description ? ` — ${r.expenditure_description}` : ""}`.slice(0, 140),
+      });
+    }
+    if (rows.length) contribUpsertMany(rows);
+  } catch (e) { console.warn("[ingestScheduleE]", e.message); }
 }
 
 // Cycles for a donor search: current 2-year cycle (even year ≥ now) stepping back. depth "6"
@@ -683,7 +879,14 @@ app.post("/api/donors/watchlist/refresh", fecLimiter, async (_req, res) => {
   });
 });
 
-app.get("/api/donors/stats", (_req, res) => res.json(contribStats()));
+app.get("/api/donors/stats", (_req, res) => {
+  // bulk* consts are declared later in the file — fine at request time (handlers run post-load)
+  const last = bulkLastGet();
+  res.json({
+    ...contribStats(), ...fecRefStats(),
+    bulk: { running: bulkJob.running, lastAt: last?.at ?? null, lastOk: last?.ok ?? null, nextAt: bulkNextAt() },
+  });
+});
 
 // ============================================================================
 //  Who-funds-who tools — donor overlap, employer/occupation reverse lookup,
@@ -890,11 +1093,39 @@ app.get("/api/graph", fecLimiter, async (req, res) => {
   const committeeId = qstr(req.query.committeeId).trim().toUpperCase();
   const donorKey = qstr(req.query.donorKey).trim();
   const name = qstr(req.query.name).trim();
-  const cycle = qstr(req.query.cycle).trim(); // "" = all stored cycles
+  const cycle = qstr(req.query.cycle).trim(); // "" = all stored cycles (TN rows carry report YEAR here)
+  const reportFilter = qstr(req.query.report).trim(); // TN: exact report name within the year
   const trace = qstr(req.query.trace) === "1";
+  const candOnly = qstr(req.query.candOnly) === "1"; // cleaner view: only candidate-committee flows
   if (!committeeId && !donorKey) {
     return res.status(400).json({ error: { message: "Provide committeeId or donorKey." } });
   }
+
+  // Is this committee a CANDIDATE committee? Best evidence first: a candidate_id on the rows,
+  // then the fec_committee master (cand_id or principal type H/S/P), then name shape — FEC
+  // campaign naming ("X FOR CONGRESS", "COMMITTEE TO ELECT") or TN's "LAST, FIRST" person format.
+  const looksCandidate = (id, name, candId) => {
+    if (candId) return true;
+    const m = id && /^C\d{4,}$/.test(String(id)) ? fecCommitteeGet(id) : null;
+    if (m) return Boolean(m.cand_id) || /^[HSP]$/i.test(m.type || "");
+    const nm = String(name || "");
+    return /FOR (CONGRESS|SENATE|GOVERNOR|PRESIDENT|STATE|HOUSE|ASSEMBLY|MAYOR)|COMMITTEE TO ELECT|\bCAMPAIGN\b/i.test(nm)
+      || /^[A-Z .'-]+,\s*[A-Z]/.test(nm.trim());
+  };
+
+  // Scope metadata for the client's year/report picker — collected from the center's RAW rows
+  // (pre-filter, so the picker stays complete while a filter is active). Report names are only
+  // meaningful for TN rows (FEC schedule_b stuffs free-text descriptions into `report`).
+  const yearsSet = new Set();
+  const reportPairs = new Map(); // `${year}|${report}` -> {year, report}
+  const collectScope = (rows) => {
+    for (const r of rows) {
+      if (r.cycle) yearsSet.add(String(r.cycle));
+      if (r.source === "tn" && r.cycle && r.report) {
+        reportPairs.set(`${r.cycle}|${r.report}`, { year: String(r.cycle), report: String(r.report) });
+      }
+    }
+  };
 
   const notes = [];
   const nodes = new Map(); // id -> node
@@ -905,7 +1136,14 @@ app.get("/api/graph", fecLimiter, async (req, res) => {
     nodes.set(id, cur);
   };
   const addEdge = (from, to, f, kind) => edges.push({ from, to, total: Math.round(f.total * 100) / 100, count: f.count, kind });
-  const inCycle = (rows) => (cycle ? rows.filter((r) => !r.cycle || String(r.cycle) === cycle) : rows);
+  // scopeAll = year/cycle filter (applies everywhere, incl. hop-2); scopeCenter additionally
+  // pins a single TN report — but only on center-adjacent rows, since other entities' reports
+  // share generic names ("Annual") and matching them would be meaningless.
+  const scopeAll = (rows) => (cycle ? rows.filter((r) => !r.cycle || String(r.cycle) === cycle) : rows);
+  const scopeCenter = (rows) => {
+    const out = scopeAll(rows);
+    return reportFilter ? out.filter((r) => String(r.report || "") === reportFilter) : out;
+  };
   const conduit = (k) => FLOW_CONDUIT_RE.test(String(k || ""));
 
   if (committeeId) {
@@ -914,8 +1152,11 @@ app.get("/api/graph", fecLimiter, async (req, res) => {
       if (errs.length) notes.push(...errs);
     }
     const centerId = `c:${committeeId}`;
-    const inRows = inCycle(contribEdgeRows({ recipientIds: [committeeId], kind: "contribution" }));
-    const outRows = inCycle(contribEdgeRows({ recipientIds: [committeeId], kind: "disbursement" }));
+    const rawIn = contribEdgeRows({ recipientIds: [committeeId], kind: "contribution" });
+    const rawOut = contribEdgeRows({ recipientIds: [committeeId], kind: "disbursement" });
+    collectScope(rawIn); collectScope(rawOut);
+    const inRows = scopeCenter(rawIn);
+    const outRows = scopeCenter(rawOut);
     const centerName = name || inRows.find((r) => r.recipientName)?.recipientName
       || outRows.find((r) => r.recipientName)?.recipientName || committeeId;
     addNode(centerId, { kind: "committee", name: centerName, committeeId, col: 2, center: true });
@@ -927,7 +1168,8 @@ app.get("/api/graph", fecLimiter, async (req, res) => {
         name: d.name, donorKey: d.key, employer: d.employer, state: d.state, col: 1 });
       addEdge(`d:${d.key}`, centerId, d, "contribution");
     }
-    const payees = topFlows(outRows, (r) => r.donorKey, (r) => r.donorName, 14, (r) => ({ state: r.state }));
+    // candOnly = contributions-to-candidates view: vendors/payees are noise, drop the whole right side
+    const payees = candOnly ? [] : topFlows(outRows, (r) => r.donorKey, (r) => r.donorName, 14, (r) => ({ state: r.state }));
     for (const p of payees) {
       addNode(`p:${p.key}`, { kind: conduit(p.key) ? "conduit" : "payee", name: p.name, donorKey: p.key, state: p.state, col: 3 });
       addEdge(centerId, `p:${p.key}`, p, "disbursement");
@@ -941,7 +1183,7 @@ app.get("/api/graph", fecLimiter, async (req, res) => {
     // hop 2 left: where the top (non-conduit) donors also give
     const hopDonors = donors.filter((d) => !conduit(d.key)).slice(0, 8).map((d) => d.key);
     if (hopDonors.length) {
-      const rows2 = inCycle(contribEdgeRows({ donorKeys: hopDonors, kind: "contribution" }))
+      const rows2 = scopeAll(contribEdgeRows({ donorKeys: hopDonors, kind: "contribution" }))
         .filter((r) => String(r.recipientId || "").toUpperCase() !== committeeId);
       const byDonor = new Map();
       for (const r of rows2) {
@@ -949,7 +1191,8 @@ app.get("/api/graph", fecLimiter, async (req, res) => {
         list.push(r); byDonor.set(r.donorKey, list);
       }
       for (const [dk, list] of byDonor) {
-        for (const f of topFlows(list, (r) => String(r.recipientId || "").toUpperCase(), (r) => r.recipientName, 4)) {
+        for (const f of topFlows(list, (r) => String(r.recipientId || "").toUpperCase(), (r) => r.recipientName, 4, (r) => ({ candId: r.candidateId }))) {
+          if (candOnly && !looksCandidate(f.key, f.name, f.candId)) continue; // cleaner view: candidate committees only
           addNode(`c:${f.key}`, { kind: "committee", name: f.name, committeeId: f.key, col: 0 });
           addEdge(`d:${dk}`, `c:${f.key}`, f, "contribution");
         }
@@ -958,7 +1201,7 @@ app.get("/api/graph", fecLimiter, async (req, res) => {
     // hop 2 right: who else pays the top payees
     const hopPayees = payees.filter((p) => !conduit(p.key)).slice(0, 6).map((p) => p.key);
     if (hopPayees.length) {
-      const rows3 = inCycle(contribEdgeRows({ donorKeys: hopPayees, kind: "disbursement" }))
+      const rows3 = scopeAll(contribEdgeRows({ donorKeys: hopPayees, kind: "disbursement" }))
         .filter((r) => String(r.recipientId || "").toUpperCase() !== committeeId);
       const byPayee = new Map();
       for (const r of rows3) {
@@ -975,18 +1218,22 @@ app.get("/api/graph", fecLimiter, async (req, res) => {
   } else {
     // donor-centered graph
     const centerId = `d:${donorKey}`;
-    const gaveRows = inCycle(contribEdgeRows({ donorKeys: [donorKey], kind: "contribution" }));
-    const paidRows = inCycle(contribEdgeRows({ donorKeys: [donorKey], kind: "disbursement" })); // committees that PAID this entity
+    const rawGave = contribEdgeRows({ donorKeys: [donorKey], kind: "contribution" });
+    const rawPaid = contribEdgeRows({ donorKeys: [donorKey], kind: "disbursement" });
+    collectScope(rawGave); collectScope(rawPaid);
+    const gaveRows = scopeCenter(rawGave);
+    const paidRows = scopeCenter(rawPaid); // committees that PAID this entity
     const centerName = name || gaveRows.find((r) => r.donorName)?.donorName
       || paidRows.find((r) => r.donorName)?.donorName || donorKey.split("|")[0];
     addNode(centerId, { kind: "donor", name: centerName, donorKey, col: 2, center: true });
 
-    const recips = topFlows(gaveRows, (r) => String(r.recipientId || "").toUpperCase(), (r) => r.recipientName, 14, (r) => ({ source: r.source }));
+    const recips = topFlows(gaveRows, (r) => String(r.recipientId || "").toUpperCase(), (r) => r.recipientName, 14, (r) => ({ source: r.source, candId: r.candidateId }))
+      .filter((f) => !candOnly || looksCandidate(f.key, f.name, f.candId)); // cleaner view: candidate committees only
     for (const f of recips) {
       addNode(`c:${f.key}`, { kind: "committee", name: f.name, committeeId: f.key, source: f.source, col: 3 });
       addEdge(centerId, `c:${f.key}`, f, "contribution");
     }
-    const payers = topFlows(paidRows, (r) => String(r.recipientId || "").toUpperCase(), (r) => r.recipientName, 8);
+    const payers = candOnly ? [] : topFlows(paidRows, (r) => String(r.recipientId || "").toUpperCase(), (r) => r.recipientName, 8);
     for (const f of payers) {
       addNode(`cp:${f.key}`, { kind: "committee", name: f.name, committeeId: f.key, col: 1 });
       addEdge(`cp:${f.key}`, centerId, f, "disbursement");
@@ -994,7 +1241,7 @@ app.get("/api/graph", fecLimiter, async (req, res) => {
     // hop 2: top co-donors of the committees this donor funds
     const hopRecips = recips.slice(0, 6).map((f) => f.key).filter(Boolean);
     if (hopRecips.length) {
-      const rows2 = inCycle(contribEdgeRows({ recipientIds: hopRecips, kind: "contribution" }))
+      const rows2 = scopeAll(contribEdgeRows({ recipientIds: hopRecips, kind: "contribution" }))
         .filter((r) => r.donorKey !== donorKey && !conduit(r.donorKey));
       const byRecip = new Map();
       for (const r of rows2) {
@@ -1017,6 +1264,10 @@ app.get("/api/graph", fecLimiter, async (req, res) => {
   res.json({
     center: committeeId ? { committeeId, name } : { donorKey, name },
     cycle: cycle || "all",
+    ...(candOnly ? { candOnly: true } : {}),
+    ...(reportFilter ? { reportFilter } : {}),
+    years: [...yearsSet].sort().reverse(),
+    reports: [...reportPairs.values()].sort((a, b) => b.year.localeCompare(a.year) || a.report.localeCompare(b.report)).slice(0, 120),
     nodes: nodeList,
     edges: edges.filter((e) => keep.has(e.from) && keep.has(e.to)).slice(0, 160),
     coverage: "Flows are drawn from this app's stored ledger (what's been pulled so far), not the FEC's complete file. Trace FEC tops up the center committee's top-100 receipts and disbursements.",
@@ -1046,6 +1297,8 @@ app.get("/api/flows/rows", (req, res) => {
   });
   if (cycle) rows = rows.filter((r) => !r.cycle || String(r.cycle) === cycle);
   if (date) rows = rows.filter((r) => r.date === date);
+  const reportFilter = qstr(req.query.report).trim(); // TN: pin to one report within the year
+  if (reportFilter) rows = rows.filter((r) => String(r.report || "") === reportFilter);
   rows.sort((a, b) => String(b.date || "").localeCompare(String(a.date || "")) || ((b.amount || 0) - (a.amount || 0)));
   const total = rows.reduce((a, r) => a + (Number(r.amount) || 0), 0);
   res.json({
@@ -1088,7 +1341,8 @@ app.get("/api/patterns/timing", fecLimiter, async (req, res) => {
     const amt = Number(r.amount) || 0;
     g.total += amt; g.gifts++;
     g._donors.add(r.donorKey);
-    if (amt >= MAXOUT_MIN) g.maxOuts++;
+    // max-out = the INDIVIDUAL per-election limit — a PAC's routine $5k check isn't one
+    if (amt >= MAXOUT_MIN && !ORG_ENTITY_RE.test(r.entityType || "")) g.maxOuts++;
     const emp = normalizeEmployerName(r.employer || "");
     // employer bundling only means something for real employers — skip the catch-all buckets
     if (emp && !/^(\(blank\)|SELF-EMPLOYED|NOT EMPLOYED|RETIRED|HOMEMAKER|STUDENT)$/.test(emp)) {
@@ -1195,8 +1449,24 @@ const SECTOR_RULES_SRV = [
   ["Consulting & PR", /consult|strateg|advisory|public relations|marketing|advertis|communications/i],
   ["Retired / Individual", /retired|homemaker|self[- ]employed|student|housewife|independent/i],
 ];
+// Famous employers whose names carry no industry keywords — checked before the keyword rules
+// (caught live: BLACKSTONE filed under "Other" despite being the world's largest PE firm).
+const FAMOUS_EMPLOYERS = [
+  ["Finance & Banking", /\b(BLACKSTONE|BLACKROCK|KKR|CARLYLE|APOLLO GLOBAL|CITADEL|VANGUARD|FIDELITY|SCHWAB|GOLDMAN|MORGAN STANLEY|JPMORGAN|CHASE\b|WELLS FARGO|CITIGROUP|AMERIPRISE|RAYMOND JAMES|EDWARD JONES|TRUIST|PNC\b|STEPHENS INC)\b/],
+  ["Tech & Telecom", /\b(GOOGLE|ALPHABET|MICROSOFT|APPLE|AMAZON|META\b|FACEBOOK|NETFLIX|ORACLE|SALESFORCE|NVIDIA|INTEL|IBM|CISCO|DELL|HP\b|AT ?& ?T|VERIZON|T-?MOBILE|COMCAST|SPACEX|TESLA|PALANTIR|UBER|AIRBNB)\b/],
+  ["Retail & Hospitality", /\b(WALMART|TARGET|COSTCO|KROGER|PUBLIX|DOLLAR GENERAL|HOME DEPOT|LOWE'?S|MCDONALD|STARBUCKS|YUM\b|MARRIOTT|HILTON|HYATT|CRACKER BARREL|PILOT (COMPANY|CORP|TRAVEL))\b/],
+  ["Pharma & Healthcare", /\b(PFIZER|MERCK|ELI LILLY|JOHNSON & JOHNSON|ABBVIE|AMGEN|MODERNA|HCA\b|UNITEDHEALTH|CIGNA|AETNA|HUMANA|CVS|WALGREENS|VANDERBILT UNIVERSITY MEDICAL)\b/],
+  ["Energy & Utilities", /\b(EXXON|CHEVRON|SHELL|BP\b|CONOCO|HALLIBURTON|DUKE ENERGY|NEXTERA|TVA\b|SOUTHERN COMPANY)\b/],
+  ["Automotive & Manufacturing", /\b(FORD|GENERAL MOTORS|GM\b|TOYOTA|NISSAN|VOLKSWAGEN|CATERPILLAR|DEERE|3M\b|GE\b|GENERAL ELECTRIC|EASTMAN)\b/],
+  ["Defense & Aerospace", /\b(LOCKHEED|RAYTHEON|RTX\b|NORTHROP|BOEING|GENERAL DYNAMICS|ANDURIL|L3HARRIS)\b/],
+  ["Legal & Lobbying", /\b(KIRKLAND & ELLIS|LATHAM & WATKINS|SKADDEN|JONES DAY|K&L GATES|AKIN GUMP|HOLLAND & KNIGHT|BAKER DONELSON)\b/],
+  ["Agriculture", /\b(CARGILL|TYSON|ADM\b|ARCHER DANIELS|PERDUE|SMITHFIELD)\b/],
+  ["Transportation", /\b(FEDEX|UPS\b|UNION PACIFIC|CSX\b|NORFOLK SOUTHERN|DELTA AIR|AMERICAN AIRLINES|UNITED AIRLINES|SOUTHWEST AIRLINES)\b/],
+];
 function classifySectorSrv(employer = "", occupation = "") {
   const txt = `${employer || ""} ${occupation || ""}`;
+  const up = txt.toUpperCase();
+  for (const [sector, re] of FAMOUS_EMPLOYERS) if (re.test(up)) return sector;
   for (const [sector, re] of SECTOR_RULES_SRV) if (re.test(txt)) return sector;
   return "Other";
 }
@@ -1308,14 +1578,26 @@ app.get("/api/patterns/composition", fecLimiter, async (req, res) => {
     .map((g) => ({ ...g, total: rnd2(g.total), donors: g.donors.size }));
 
   // ---- sectors ----
+  // Org-entity donors (PACs, parties, committees) get their own bucket up front — they carry no
+  // employer/occupation, so the keyword classifier dumped ALL committee money into "Other"
+  // (verified live: 75% of a real committee's total), burying the actual industry signal.
   const secM = new Map();
   for (const r of rows) {
-    const sector = classifySectorSrv(r.employer, r.occupation);
-    const g = secM.get(sector) || { sector, total: 0, gifts: 0, donors: new Set(), emp: new Map() };
+    const sector = (ORG_ENTITY_RE.test(r.entityType || "") || /\b(PAC|POLITICAL ACTION COMMITTEE)\b/i.test(r.donorName || ""))
+      ? "PACs & Committees" : classifySectorSrv(r.employer, r.occupation);
+    const g = secM.get(sector) || { sector, total: 0, gifts: 0, donors: new Set(), emp: new Map(), don: new Map() };
     const amt = Number(r.amount) || 0;
     g.total += amt; g.gifts++; g.donors.add(r.donorKey);
     const emp = normalizeEmployerName(r.employer || "");
     if (emp && emp !== "(blank)") g.emp.set(emp, (g.emp.get(emp) || 0) + amt);
+    // per-sector donor rollup — powers the "Donors ▸" drill-through on the Sectors tab
+    const dg = g.don.get(r.donorKey) || { donorKey: r.donorKey, name: r.donorName, employer: r.employer,
+      occupation: r.occupation, city: r.city, state: r.state, total: 0, count: 0 };
+    if (!dg.name && r.donorName) dg.name = r.donorName;
+    if (!dg.employer && r.employer) dg.employer = r.employer;
+    if (!dg.occupation && r.occupation) dg.occupation = r.occupation;
+    dg.total += amt; dg.count++;
+    g.don.set(r.donorKey, dg);
     secM.set(sector, g);
   }
   const grand = rows.reduce((a, r) => a + (Number(r.amount) || 0), 0);
@@ -1324,6 +1606,8 @@ app.get("/api/patterns/composition", fecLimiter, async (req, res) => {
     pct: grand ? Math.round((g.total / grand) * 1000) / 10 : 0,
     topEmployers: [...g.emp.entries()].sort((a, b) => b[1] - a[1]).slice(0, 3)
       .map(([employer, total]) => ({ employer, total: rnd2(total) })),
+    topDonors: [...g.don.values()].sort((a, b) => b.total - a.total).slice(0, 12)
+      .map((d) => ({ ...d, total: rnd2(d.total) })),
   }));
 
   // ---- households (individuals only: same surname + same city) ----
@@ -1334,6 +1618,11 @@ app.get("/api/patterns/composition", fecLimiter, async (req, res) => {
     const toks = s.split(/\s+/);
     return toks.length > 1 ? toks[toks.length - 1] : s;
   };
+  // Member identity = honorific/suffix-stripped sorted name tokens, NOT donor_key — otherwise
+  // "FRANK ROYALL" and "FRANK ROYALL MR." count as a 2-person household (caught live).
+  const HONORIFIC_RE = /^(MR|MRS|MS|DR|MISS|HON|REV|JR|SR|II|III|IV|V)$/;
+  const memberKeyOf = (nm) => String(nm || "").toUpperCase().replace(/[^A-Z ]/g, " ").split(/\s+/)
+    .filter((t) => t && !HONORIFIC_RE.test(t)).sort().join(" ");
   const hhM = new Map();
   for (const r of rows) {
     if (ORG_ENTITY_RE.test(r.entityType || "")) continue;
@@ -1344,12 +1633,13 @@ app.get("/api/patterns/composition", fecLimiter, async (req, res) => {
     const g = hhM.get(k) || { surname, place, members: new Map(), total: 0, dates: new Map() };
     const amt = Number(r.amount) || 0;
     g.total += amt;
-    const m = g.members.get(r.donorKey) || { name: r.donorName, total: 0, count: 0 };
+    const mk = memberKeyOf(r.donorName) || r.donorKey;
+    const m = g.members.get(mk) || { name: r.donorName, total: 0, count: 0 };
     m.total += amt; m.count++;
-    g.members.set(r.donorKey, m);
+    g.members.set(mk, m);
     if (r.date) {
       const dset = g.dates.get(r.date) || new Set();
-      dset.add(r.donorKey); g.dates.set(r.date, dset);
+      dset.add(mk); g.dates.set(r.date, dset);
     }
     hhM.set(k, g);
   }
@@ -1405,6 +1695,7 @@ app.get("/api/patterns/outside", fecLimiter, async (req, res) => {
       if (d.results?.length) cycleUsed = prev;
     }
     results = d.results || [];
+    ingestScheduleE(results); // permanent capture — IEs land as kind "ie", never in contribution sums
   } catch (e) {
     return res.status(502).json({ error: { message: `Schedule E unavailable: ${e.message}` } });
   }
@@ -1415,7 +1706,12 @@ app.get("/api/patterns/outside", fecLimiter, async (req, res) => {
     const amt = Number(r.expenditure_amount) || 0;
     const cid = String(r.committee_id || "").toUpperCase();
     const k = cid || (r.committee_name || r.payee_name || "?");
-    const g = m.get(k) || { committeeId: cid || null, name: r.committee_name || r.payee_name || "?", support: 0, oppose: 0 };
+    const g = m.get(k) || { committeeId: cid || null, name: null, payeeFallback: null, support: 0, oppose: 0 };
+    // committee_name is the SPENDER; payee_name is the vendor they paid. Some Schedule E rows
+    // omit committee_name — never let the vendor masquerade as the spender (caught live:
+    // "TOTAL VIDEO PLACEMENTS" rendered as a $1.3M "spender").
+    if (!g.name && r.committee_name) g.name = r.committee_name;
+    if (!g.payeeFallback && r.payee_name) g.payeeFallback = r.payee_name;
     if ((r.support_oppose_indicator || "") === "S") { g.support += amt; totalSupport += amt; }
     else { g.oppose += amt; totalOppose += amt; }
     m.set(k, g);
@@ -1423,6 +1719,18 @@ app.get("/api/patterns/outside", fecLimiter, async (req, res) => {
   const spenders = [...m.values()]
     .sort((a, b) => Math.max(b.support, b.oppose) - Math.max(a.support, a.oppose))
     .slice(0, 8);
+
+  // resolve missing spender names from the committee record (cached fecFetch, best-effort)
+  for (const s of spenders) {
+    if (!s.name && s.committeeId && /^C\d{4,}$/.test(s.committeeId)) {
+      try {
+        const d = await fecFetch(`committee/${s.committeeId}/`);
+        s.name = d.results?.[0]?.name || null;
+      } catch { /* fall through to payee fallback */ }
+    }
+    s.name = s.name || (s.payeeFallback ? `${s.payeeFallback} (payee — spender unnamed)` : s.committeeId || "?");
+    delete s.payeeFallback;
+  }
 
   // funder chains: top-up + read each big spender's own donors from the stored ledger
   for (const s of spenders.slice(0, 5)) {
@@ -1452,6 +1760,155 @@ app.get("/api/patterns/outside", fecLimiter, async (req, res) => {
   });
 });
 
+// ---- federal candidate watchlist (completes the tracking triad: donors, TN entities, candidates) ----
+
+// Attach latest filing totals + delta vs last-seen receipts to each tracked candidate.
+function candWatchListEnriched() {
+  return candWatchRows().map((w) => {
+    const totals = candidateTotalsList(w.candId);
+    const latest = totals[0] || null;
+    const deltaReceipts = latest?.receipts != null && w.lastReceipts != null
+      ? Math.round((latest.receipts - w.lastReceipts) * 100) / 100 : null;
+    return { ...w, latest, deltaReceipts, filings: totals.length };
+  });
+}
+
+app.get("/api/candidates/watchlist", (_req, res) => res.json({ candidates: candWatchListEnriched() }));
+
+app.post("/api/candidates/watch", (req, res) => {
+  const { candId = "", name = "", party = "", state = "", office = "", district = "", pcc = "" } = req.body || {};
+  if (!String(candId).trim() || !String(name).trim()) return res.status(400).json({ error: { message: "Missing candId or name." } });
+  candWatchAdd({ candId: String(candId).trim(), name: String(name).trim(), party, state, office, district, pcc });
+  const latest = candidateTotalsList(String(candId).trim())[0];
+  candWatchMarkSeen(String(candId).trim(), latest?.receipts ?? null); // baseline change detection at add
+  res.json({ ok: true });
+});
+
+app.delete("/api/candidates/watch", (req, res) => {
+  const id = qstr(req.query.id).trim();
+  if (!id) return res.status(400).json({ error: { message: "Missing id." } });
+  candWatchRemove(id);
+  res.json({ ok: true });
+});
+
+app.post("/api/candidates/watch/seen", (req, res) => {
+  const id = String(req.body?.candId || "").trim();
+  if (!id) return res.status(400).json({ error: { message: "Missing candId." } });
+  candWatchMarkSeen(id, candidateTotalsList(id)[0]?.receipts ?? null);
+  res.json({ ok: true });
+});
+
+// Actively re-check tracked candidates: fresh totals + a probe-gated top-100 receipts top-up.
+app.post("/api/candidates/watchlist/refresh", fecLimiter, async (_req, res) => {
+  const watched = candWatchRows().slice(0, 10);
+  const errors = [];
+  for (const w of watched) {
+    try {
+      const d = await fecFetch(`candidate/${w.candId}/totals/`, { per_page: "3" });
+      ingestCandidateTotals(d.results);
+    } catch (e) { errors.push(`${w.name}: ${e.message}`); }
+    if (w.pcc && /^C\d{4,}$/.test(w.pcc)) errors.push(...await topUpCommittee(w.pcc, String(currentCycle())));
+  }
+  res.json({ candidates: candWatchListEnriched(), checked: watched.length,
+    ...(errors.length ? { note: errors.join("; ") } : {}) });
+});
+
+// ---- nationwide quick-find (stored masters + ledger donors — zero FEC calls) ----
+app.get("/api/find", (req, res) => {
+  const q = qstr(req.query.q).trim();
+  if (q.length < 2) return res.json({ candidates: [], committees: [], donors: [] });
+  const m = fecMasterFind(q, 8);
+  const donors = contribDonorGroups({ q, limit: 5 })
+    .map(({ donorKey, name, employer, state, total, count }) => ({ donorKey, name, employer, state, total, count }));
+  res.json({ ...m, donors });
+});
+
+// ---- filing-period totals for sparklines (accrues from every totals/elections pull) ----
+app.get("/api/candidates/trends", (req, res) => {
+  const ids = qstr(req.query.ids).split(",").map((s) => s.trim()).filter(Boolean).slice(0, 60);
+  res.json({ trends: candidateTotalsForMany(ids) });
+});
+
+// ---- alert engine: filings, attack ads, PAC spreading, standing searches ----
+// One scan, four detectors, one ref-deduped permanent feed. IE pulls are probe-gated (6h).
+async function runAlertScan() {
+  const since = Number(settingGet("alertScanAt") || 0) || (Date.now() - 7 * 86400e3);
+  const alerts = [];
+  const fk = (v) => (v < 0 ? `-$${Math.round(-v).toLocaleString()}` : `$${Math.round(v).toLocaleString()}`);
+  for (const w of candWatchListEnriched().slice(0, 25)) {
+    if (w.latest?.coverageEnd && w.deltaReceipts > 0) {
+      alerts.push({ kind: "filing", subject: w.name, ref: `filing:${w.candId}:${w.latest.coverageEnd}`,
+        amount: w.deltaReceipts, detail: `New filing thru ${w.latest.coverageEnd} — receipts up ${fk(w.deltaReceipts)} (now ${fk(w.latest.receipts || 0)})` });
+    }
+    // attack-ad radar: probe-gated schedule_e pull, then diff stored IEs
+    const pk = `alert:ie:${w.candId}`;
+    const probe = probeGet(pk);
+    if (!probe || Date.now() - probe.checkedAt > 6 * 3600e3) {
+      try {
+        const d = await fecFetch("schedules/schedule_e/", { candidate_id: w.candId,
+          two_year_transaction_period: String(currentCycle()), sort: "-expenditure_amount", per_page: "100" });
+        ingestScheduleE(d.results);
+        probeSet(pk, String(d.pagination?.count ?? 0));
+      } catch { /* offline — stored rows still diff */ }
+    }
+    const ie = ieNewSince(w.candId, since);
+    if (ie.againstN > 0) alerts.push({ kind: "ie", subject: w.name, amount: ie.againstAmt,
+      ref: `ie-a:${w.candId}:${Math.round(ie.againstAmt)}:${ie.againstN}`,
+      detail: `⚠ ${fk(ie.againstAmt)} in NEW outside money AGAINST (${ie.againstN} expenditure${ie.againstN === 1 ? "" : "s"})` });
+    if (ie.forN > 0) alerts.push({ kind: "ie", subject: w.name, amount: ie.forAmt,
+      ref: `ie-f:${w.candId}:${Math.round(ie.forAmt)}:${ie.forN}`,
+      detail: `${fk(ie.forAmt)} in new outside money FOR (${ie.forN} expenditure${ie.forN === 1 ? "" : "s"})` });
+  }
+  // PAC spreading: tracked donors gaining recipients (donor watchlist entries, org or not)
+  for (const w of watchList().slice(0, 25)) {
+    const recips = donorNewRecipSince(w.donorKey, since);
+    if (recips.length >= 2) {
+      alerts.push({ kind: "pac", subject: w.displayName, amount: recips.reduce((a, r) => a + r.total, 0),
+        ref: `pac:${w.donorKey}:${since}`,
+        detail: `Gave to ${recips.length} newly-stored recipient${recips.length === 1 ? "" : "s"}: ${recips.slice(0, 4).map((r) => r.name).join(" · ")}` });
+    }
+  }
+  // standing searches
+  for (const s of ssList()) {
+    const r = fieldNewSince(s.q, s.field, s.lastChecked || s.addedAt);
+    if (r.n > 0) {
+      alerts.push({ kind: "search", subject: `"${s.q}" (${s.field})`, amount: r.amt,
+        ref: `ss:${s.id}:${Date.now()}`, detail: `${r.n} new gift${r.n === 1 ? "" : "s"} · ${fk(r.amt)}` });
+      ssMarkSeen(s.id);
+    }
+  }
+  const added = alertAdd(alerts);
+  settingSet("alertScanAt", String(Date.now()));
+  return { added, scannedAt: Date.now() };
+}
+
+app.get("/api/alerts", (_req, res) => {
+  const seenAt = Number(settingGet("alertSeenAt") || 0);
+  const feed = alertList(80);
+  res.json({ feed, unseen: feed.filter((a) => a.at > seenAt).length,
+    lastScanAt: Number(settingGet("alertScanAt") || 0) || null, searches: ssList() });
+});
+app.post("/api/alerts/scan", fecLimiter, async (_req, res) => {
+  try { res.json(await runAlertScan()); }
+  catch (e) { res.status(500).json({ error: { message: e.message } }); }
+});
+app.post("/api/alerts/seen", (_req, res) => { settingSet("alertSeenAt", String(Date.now())); res.json({ ok: true }); });
+app.post("/api/searches", (req, res) => {
+  const q = String(req.body?.q || "").trim(), field = req.body?.field === "occupation" ? "occupation" : "employer";
+  if (q.length < 3) return res.status(400).json({ error: { message: "Query too short." } });
+  ssAdd({ q, field }); res.json({ ok: true });
+});
+app.delete("/api/searches", (req, res) => { ssRemove(qstr(req.query.id)); res.json({ ok: true }); });
+
+// piggyback: scheduled bulk imports end with a scan, so the feed fills itself weekly
+setInterval(() => {
+  const last = bulkLastGet();
+  if (last?.ok && last.trigger === "schedule" && Date.now() - last.at < 11 * 60e3
+    && Number(settingGet("alertScanAt") || 0) < last.at) {
+    runAlertScan().catch((e) => console.warn("[alert-scan]", e.message));
+  }
+}, 600_000).unref();
+
 // Stored FEC rows for a committee — the offline/rate-limited fallback for the donor table.
 // MUST be registered BEFORE app.get("/api/fec/*") below or the wildcard swallows it and answers
 // "Endpoint not allowed: stored" (same class of bug as the districts/competitive-vs-:fips fix).
@@ -1474,34 +1931,32 @@ app.get("/api/fec/*", fecLimiter, async (req, res) => {
     return res.status(400).json({ error: { message: `Endpoint not allowed: ${fecPath}` } });
   }
   const forceRefresh = req.query._refresh === "1";
-  const params = new URLSearchParams(req.query);
-  params.delete("api_key");
-  params.delete("_refresh"); // never forward to FEC
-  params.set("api_key", FEC_API_KEY);
-  const url = `${FEC_BASE}/${fecPath}?${params}`;
-
-  if (!forceRefresh) {
-    const cached = cacheGetWithAge(url);
-    if (cached) {
-      res.set("x-fec-cache", "hit");
-      if (cached.createdAt) res.set("x-cached-at", String(cached.createdAt));
-      return res.status(cached.value.status).json(cached.value.body);
-    }
+  const params = new URLSearchParams();
+  for (const [k, v] of Object.entries(req.query)) {
+    if (k === "api_key" || k === "_refresh") continue; // never forward to FEC
+    for (const one of Array.isArray(v) ? v : [v]) if (typeof one === "string") params.append(k, one);
   }
   try {
-    const upstream = await fetch(url, { headers: { accept: "application/json" }, signal: AbortSignal.timeout(FEC_FETCH_TIMEOUT_MS) });
-    const body = await upstream.json().catch(() => ({ error: { message: "Non-JSON response from FEC" } }));
-    if (upstream.ok) cacheSet(url, { status: upstream.status, body }, TTL.fec);
-    res.set("x-fec-cache", "miss");
-    res.status(upstream.status).json(body);
+    const r = await fecGet(fecPath, params, { fresh: forceRefresh });
+    res.set("x-fec-cache", r.cache);
+    if (r.cachedAt) res.set("x-cached-at", String(r.cachedAt));
+    if (r.note) res.set("x-fec-note", r.note.replace(/[^\x20-\x7E]/g, " ").slice(0, 200));
+    const body = r.body;
+    res.status(r.status).json(body);
     // Feed itemized schedule rows into the permanent donor ledger AFTER responding (setImmediate =
-    // zero added latency). Cache hits above skip this: their rows were ingested at first fetch.
-    if (upstream.ok && body?.results?.length) {
+    // zero added latency). Cache hits skip this: their rows were ingested at first fetch.
+    if (r.cache === "miss" && r.status < 400 && body?.results?.length) {
       if (fecPath.startsWith("schedules/schedule_a")) setImmediate(() => ingestScheduleA(body.results));
       else if (fecPath.startsWith("schedules/schedule_b")) setImmediate(() => ingestScheduleB(body.results));
+      else if (fecPath.startsWith("schedules/schedule_e")) setImmediate(() => ingestScheduleE(body.results));
+      // permanent candidate/committee capture — identity + filing-period totals never expire
+      else if (/^candidate\/[^/]+\/totals/.test(fecPath)) setImmediate(() => ingestCandidateTotals(body.results));
+      else if (fecPath.startsWith("candidates/")) setImmediate(() => ingestCandidateObjects(body.results));
+      else if (fecPath.startsWith("elections/")) { const cy = qstr(req.query.cycle); setImmediate(() => ingestElectionRows(body.results, cy)); }
+      else if (fecPath.startsWith("committees/") || /^committee\//.test(fecPath)) setImmediate(() => ingestCommitteeObjects(body.results));
     }
   } catch (e) {
-    res.status(502).json({ error: { message: `Upstream fetch failed: ${e.message}` } });
+    res.status(502).json({ error: { message: e.message } });
   }
 });
 
@@ -1708,20 +2163,78 @@ TASK: In 100-180 words of plain prose (no markdown, no lists), identify what kin
 });
 
 // ---- Tennessee state records (TREF) ----
-app.get("/api/tn/meta", (_req, res) => res.json({ years: TN_YEARS, offices: TN_OFFICES }));
+// /api/tn/meta now lives in tnx.js (live form metadata with these static lists as the fallback)
+
+// ---- TN entity watchlist (mirrors the Donors tab tracker) ----
+app.get("/api/tn/watchlist", (_req, res) => res.json({ entities: tnWatchList() }));
+
+app.post("/api/tn/watch", (req, res) => {
+  const tnId = String(req.body?.tnId || "").trim();
+  const name = String(req.body?.name || "").trim();
+  if (!tnId || !name) return res.status(400).json({ error: { message: "Missing tnId or name." } });
+  tnWatchAdd({ tnId, name, office: String(req.body?.office || ""), party: String(req.body?.party || "") });
+  res.json({ ok: true });
+});
+
+app.delete("/api/tn/watch", (req, res) => {
+  const tnId = qstr(req.query.id).trim();
+  if (!tnId) return res.status(400).json({ error: { message: "Missing id." } });
+  tnWatchRemove(tnId);
+  res.json({ ok: true });
+});
+
+app.post("/api/tn/watch/seen", (req, res) => {
+  const tnId = String(req.body?.tnId || "").trim();
+  if (!tnId) return res.status(400).json({ error: { message: "Missing tnId." } });
+  tnWatchMarkSeen(tnId);
+  res.json({ ok: true });
+});
 
 // TREF only does "begins with" name matching, which misses most PACs
 // (e.g. "health" never finds "Tennessee Health Care Association"). Fan out
 // over the common TN naming prefixes and merge the results.
+// UPDATE (Nov 2026): TREF honours `%` as a wildcard, so ONE "%name" search is a true contains-
+// match — it finds everything the old four-search prefix fan-out did and more ("%health" → 42
+// PACs; the fan-out found a handful), at a quarter of the requests. The plain name is only tried
+// as a fallback if the wildcard search itself errors (see the /api/tn/candidates loop).
 function tnNameVariants(raw) {
   const n = String(raw || "").trim();
   if (!n) return [""];
-  const variants = [n];
-  const lower = n.toLowerCase();
-  for (const prefix of ["tennessee ", "tn ", "tennesseans for "]) {
-    if (!lower.startsWith(prefix)) variants.push(prefix + n);
+  return [n.includes("%") ? n : `%${n}`];
+}
+
+// ---- cached TREF contribution/expenditure search ----
+// Every C&E search in the app goes through here. One cache entry per exact parameter set, so the
+// per-entity views, the donor lookup, the trend chart and the explorer all share results.
+//  * closed report years are kept 30 days (those filings no longer change); open years use TTL.tn
+//  * ↺ Refresh only re-queries OPEN years — a trend refresh is 2-4 TREF calls instead of 10
+//  * identical in-flight searches are coalesced; if TREF fails, the last good copy is served
+const TN_CLOSED_TTL_MS = 30 * DAY;
+const tnYearClosed = (reportYear) => Number(reportYear) < new Date().getFullYear() - 1;
+const moneyInflight = new Map();
+async function moneySearch(args) {
+  const norm = Object.fromEntries(Object.entries(args).filter(([, v]) => v !== "" && v != null).sort(([a], [b]) => a.localeCompare(b)));
+  const ck = `tn:ce:v1:${JSON.stringify(norm).toLowerCase()}`;
+  const closed = tnYearClosed(args.reportYear);
+  if (!(wantsRefresh() && !closed)) {
+    const hit = cacheGet(ck);
+    if (hit) return hit;
   }
-  return variants;
+  if (moneyInflight.has(ck)) return moneyInflight.get(ck);
+  const p = (async () => {
+    let result;
+    try { result = await searchMoney(args); }
+    catch (e) {
+      const stale = cacheGetStale(ck);
+      if (stale) return { ...stale.value, note: `TREF is not responding (${e.message}) — showing the copy saved ${new Date(stale.createdAt).toLocaleDateString("en-US")}.` };
+      throw e;
+    }
+    const empty = !(result.count > 0);
+    cacheSet(ck, result, closed ? (empty ? DAY : TN_CLOSED_TTL_MS) : (empty ? TN_BOUNCE_TTL_MS : TTL.tn));
+    return result;
+  })().finally(() => moneyInflight.delete(ck));
+  moneyInflight.set(ck, p);
+  return p;
 }
 
 // ---- cached wrappers around the TREF scrapers ----
@@ -1863,7 +2376,8 @@ app.get("/api/tn/candidates", async (req, res) => {
   const name = qstr(req.query.name), office = qstr(req.query.office), year = qstr(req.query.year), type = qstr(req.query.type, "both");
   if (!name && !office && !year) return res.status(400).json({ error: { message: "Provide at least a name, office, or election year." } });
   const forceRefresh = req.query._refresh === "1";
-  const ck = `tn:cand:v3:${type}:${name.toLowerCase().trim()}:${office}:${year}`;
+  const district = qstr(req.query.district), party = qstr(req.query.party), winner = qstr(req.query.winner);
+  const ck = `tn:cand:v4:${type}:${name.toLowerCase().trim()}:${office}:${year}:${district}:${party}:${winner}`;
   if (!forceRefresh) {
     const hit = cacheGetWithAge(ck);
     if (hit) {
@@ -1884,9 +2398,13 @@ app.get("/api/tn/candidates", async (req, res) => {
   const rows = [];
   const seen = new Set();
   const errors = [];
-  for (const v of variants) {
+  const foundEntities = [];
+  for (let vi = 0; vi < variants.length; vi++) {
+    const v = variants[vi];
     try {
-      const data = await searchCandidatesPacs({ name: v, officeId: office, yearId: year, type: effectiveType });
+      const data = await searchCandidatesPacs({ name: v, officeId: office, yearId: year, type: effectiveType,
+        districtId: district, partyId: party, winner });
+      if (data.entities?.length) foundEntities.push(...data.entities);
       if (!headers.length && data.headers?.length) headers = data.headers;
       for (const row of data.rows || []) {
         const key = row.cells.join("|").toUpperCase().replace(/\s+/g, " ");
@@ -1896,8 +2414,12 @@ app.get("/api/tn/candidates", async (req, res) => {
       }
     } catch (e) {
       errors.push(`"${v}": ${e.message}`);
+      // wildcard search failed — fall back once to TREF's plain begins-with match
+      if (vi === 0 && variants.length === 1 && name.trim() && v !== name.trim()) variants.push(name.trim());
     }
   }
+  // every entity TREF returns also lands in the local directory (Tennessee tab → Directory)
+  if (foundEntities.length) setImmediate(() => { try { tnEntityUpsertMany(foundEntities); } catch (e) { console.warn("[tn directory]", e.message); } });
   if (!rows.length && errors.length === variants.length) {
     return res.status(502).json({ error: { message: `TN search failed: ${errors[0]}` } });
   }
@@ -1966,11 +2488,11 @@ app.get("/api/tn/money", async (req, res) => {
   const base = { electionYearId: electionYear, reportYear };
   const out = { source: "tn-tref", name, electionYear, reportYear };
   // three sequential searches (the polite chain spaces them out; ~15-20s total cold)
-  try { out.received = normalizeMoney(await searchMoney({ ...base, searchType: "contributions", recipientName: name })); }
+  try { out.received = normalizeMoney(await moneySearch({ ...base, searchType: "contributions", recipientName: name })); }
   catch (e) { out.receivedError = e.message; }
-  try { out.gave = normalizeMoney(await searchMoney({ ...base, searchType: "contributions", contributorName: name })); }
+  try { out.gave = normalizeMoney(await moneySearch({ ...base, searchType: "contributions", contributorName: name })); }
   catch (e) { out.gaveError = e.message; }
-  try { out.spent = normalizeMoney(await searchMoney({ ...base, searchType: "expenditures", candName: name })); }
+  try { out.spent = normalizeMoney(await moneySearch({ ...base, searchType: "expenditures", candName: name })); }
   catch (e) { out.spentError = e.message; }
 
   if (out.received || out.gave || out.spent) cacheSet(ck, out, TTL.tn);
@@ -2021,7 +2543,7 @@ app.get("/api/tn/donor", async (req, res) => {
         // years per cycle. The pairs are disjoint, so concatenation cannot duplicate rows.
         for (const ry of [labelYear, String(Number(labelYear) - 1)]) {
           try {
-            const r = normalizeMoney(await searchMoney({ searchType: "contributions", contributorName: name, electionYearId: cy.id, reportYear: ry }), 500);
+            const r = normalizeMoney(await moneySearch({ searchType: "contributions", contributorName: name, electionYearId: cy.id, reportYear: ry }), 500);
             if (!headers.length && r.headers?.length) headers = r.headers;
             if (r.rows?.length) rows.push(...r.rows);
             totalAmount += r.totalAmount || 0;
@@ -2052,7 +2574,7 @@ app.get("/api/tn/donor", async (req, res) => {
       return res.status(400).json({ error: { message: "electionYear (TREF id) and reportYear (YYYY) are required when a specific year is given." } });
     }
     const result = normalizeMoney(
-      await searchMoney({ searchType: "contributions", contributorName: name, electionYearId: electionYear, reportYear }),
+      await moneySearch({ searchType: "contributions", contributorName: name, electionYearId: electionYear, reportYear }),
       500
     );
     const out = { source: "tn-tref", name, electionYear, reportYear, ...result };
@@ -2095,11 +2617,11 @@ app.get("/api/tn/trend", async (req, res) => {
       try {
         let r;
         if (dataType === "gave") {
-          r = normalizeMoney(await searchMoney({ searchType: "contributions", contributorName: name, electionYearId: cy.id, reportYear }), 0);
+          r = normalizeMoney(await moneySearch({ searchType: "contributions", contributorName: name, electionYearId: cy.id, reportYear }), 0);
         } else if (dataType === "spent") {
-          r = normalizeMoney(await searchMoney({ searchType: "expenditures", candName: name, electionYearId: cy.id, reportYear }), 0);
+          r = normalizeMoney(await moneySearch({ searchType: "expenditures", candName: name, electionYearId: cy.id, reportYear }), 0);
         } else {
-          r = normalizeMoney(await searchMoney({ searchType: "contributions", recipientName: name, electionYearId: cy.id, reportYear }), 0);
+          r = normalizeMoney(await moneySearch({ searchType: "contributions", recipientName: name, electionYearId: cy.id, reportYear }), 0);
         }
         total += r.totalAmount || 0;
         count += r.count || 0;
@@ -2234,7 +2756,7 @@ app.get("/api/tn/activity", async (req, res) => {
     const tally = async (query) => {
       let total = 0, count = 0;
       for (const ry of reportYears) {
-        const r = normalizeMoney(await searchMoney({ ...query, electionYearId: cy.id, reportYear: ry }), 0);
+        const r = normalizeMoney(await moneySearch({ ...query, electionYearId: cy.id, reportYear: ry }), 0);
         total += r.totalAmount || 0;
         count += r.count || 0;
       }
@@ -2258,19 +2780,20 @@ app.get("/api/tn/activity", async (req, res) => {
 // Shared by the /api/tn/ledger route AND the TN dossier (which needs the same itemized money-flows
 // data) — factored out so both reuse the same cache entry / donor-ledger ingestion instead of the
 // dossier triggering a second, redundant TREF scrape.
-async function tnLedgerData(id, owner = "", forceRefresh = false) {
-  const ck = `tn:ledger:v4:${id}`;
+async function tnLedgerData(id, owner = "", forceRefresh = false, budget = 24) {
+  const ck = `tn:ledger:v5:${id}`;
   if (!forceRefresh) {
     const hit = cacheGetWithAge(ck);
-    if (hit) return { ...hit.value, cachedAt: hit.createdAt };
+    // a caller with a bigger report budget (candidate donors) may finish what a capped read left partial
+    if (hit && !(hit.value.partial && budget > 24)) return { ...hit.value, cachedAt: hit.createdAt };
   }
   {
     const list = await cachedListReports(id, owner, forceRefresh);
     // Collapse amended/duplicate filings so a period isn't double-counted (see latestFilingVersions).
     const reports = latestFilingVersions(list.rows || []);
     const withRid = reports.filter((r) => r.reportId);
-    const LEDGER_BUDGET = 24; // cap cold fetches; cached details (from prior scans) are free
-    let fetched = 0, reportsRead = 0, consecFails = 0, aborted = false;
+    const LEDGER_BUDGET = budget; // cap cold fetches; cached details (from prior scans) are free
+    let fetched = 0, reportsRead = 0, consecFails = 0, aborted = false, reportedReceipts = 0;
     const contribs = [], expenditures = [];
     const ledgerRows = []; // rows bound for the permanent donor ledger (ingested below, post-response)
     // TREF sometimes renders subtotal rows as ordinary <td> rows inside itemized tables — summing
@@ -2289,6 +2812,7 @@ async function tnLedgerData(id, owner = "", forceRefresh = false) {
       }
       if (!detail) continue;
       reportsRead++;
+      reportedReceipts += Number(detail.totals?.receipts) || 0; // the report's own TOTAL RECEIPTS line (includes unitemized)
       const yearM = (r.cells || []).join(" ").match(/\b(19|20)\d{2}\b/);
       const year = yearM ? yearM[0] : "";
       const report = r.cells?.[1] || "";
@@ -2320,7 +2844,7 @@ async function tnLedgerData(id, owner = "", forceRefresh = false) {
       source: "tn-reports", id: String(id), name: owner,
       reportsTotal: withRid.length, reportsRead, partial: aborted || reportsRead < withRid.length,
       contribs, expenditures,
-      totalReceived: sum(contribs), totalSpent: sum(expenditures),
+      totalReceived: sum(contribs), totalSpent: sum(expenditures), reportedReceipts: Math.round(reportedReceipts),
       ...(noteParts.length ? { note: noteParts.join(" ") } : {}),
     };
     // a bounced list or an aborted fetch run means this aggregate is unreliable — serve it but
@@ -2500,6 +3024,16 @@ app.get("/api/tn/reports", async (req, res) => {
     // Fall back to TTL cache
     const hit = cacheGetWithAge(`tn:rep:v2:${id}`);
     if (hit) return res.json({ ...hit.value, cachedAt: hit.createdAt });
+  }
+
+  // live=0 — background lookups (the results table's "last filed" column) only read what is already
+  // stored; they must never trigger a TREF scrape per result row.
+  if (req.query.live === "0") {
+    if (stored) {
+      const enriched = stored.reports.map((r) => ({ ...r, detail: freshStoredDetail(r.report_id) }));
+      return res.json({ reports: enriched, fetchedAt: stored.fetchedAt, source: "db-stale" });
+    }
+    return res.json({ rows: [], source: "none" });
   }
 
   // 2. Fetch from TREF
@@ -2735,11 +3269,14 @@ app.get("/api/districts/:fips", async (req, res) => {
   if (!/^\d{2}$/.test(fips)) return res.status(400).json({ error: { message: "Invalid FIPS code." } });
 
   // 1. Serve from pre-downloaded file (zero network, zero latency after first run)
+  // Streamed straight off disk (no parse + re-stringify of a multi-MB file per request), gzipped by
+  // the compression middleware, with ETag/Last-Modified so repeat page loads get a 304.
   const diskFile = path.join(DISTRICTS_DIR, `${fips}.json`);
   try {
-    const raw = fs.readFileSync(diskFile, "utf8");
-    const data = JSON.parse(raw);
-    if (data?.features?.length) return res.json(data);
+    if (fs.statSync(diskFile).size > 200) {
+      return res.sendFile(diskFile, { headers: { "Content-Type": "application/json; charset=utf-8" },
+        maxAge: 3_600_000, etag: true, lastModified: true });
+    }
   } catch { /* file not present — fall through to network */ }
 
   // 2. SQLite cache
@@ -2844,6 +3381,174 @@ app.get("/api/admin/run-script", (req, res) => {
   req.on("close", () => { if (!child.killed) child.kill(); });
 });
 
+// ---- admin: FEC bulk import — runnable + schedulable from the UI ----
+// Unlike run-script's SSE (child dies with the request), the bulk import runs DETACHED from any
+// request: minutes-long, survives the browser closing. State lives in the settings table
+// (bulkLast / bulkSchedule) so "last load" and "next load" survive restarts; live log is in-memory.
+const bulkJob = { running: false, startedAt: null, cycles: null, oth: false, log: [] };
+const bulkLogPush = (chunk) => {
+  for (const l of String(chunk).split(/\r?\n/)) {
+    const t = l.replace(/\r.*$/, "").trim(); // progress lines rewrite with \r — keep the final form
+    if (t) { bulkJob.log.push(t); if (bulkJob.log.length > 40) bulkJob.log.shift(); }
+  }
+};
+const bulkLastGet = () => { try { return JSON.parse(settingGet("bulkLast") || "null"); } catch { return null; } };
+const bulkSchedGet = () => { try { return JSON.parse(settingGet("bulkSchedule") || "null") || {}; } catch { return {}; } };
+const currentCycle = () => { const y = new Date().getFullYear(); return y % 2 ? y + 1 : y; };
+
+function bulkNextAt() {
+  const sched = bulkSchedGet();
+  if (!sched.enabled) return null;
+  const every = Math.max(6, Number(sched.everyHours) || 168) * 3_600_000;
+  return (sched.lastScheduledAt || bulkLastGet()?.at || Date.now()) + every;
+}
+
+function startBulkImport({ cycles, oth, trigger }) {
+  if (bulkJob.running) return { error: "A bulk import is already running — wait for it to finish." };
+  // "auto" resolves to the current cycle at RUN time — schedules saved as "auto" survive the
+  // 2026→2028 rollover untouched. (The script resolves it too; resolving here keeps status readable.)
+  const list = [...new Set((cycles || []).map((c) => String(c).trim().toLowerCase() === "auto" ? String(currentCycle()) : String(c).trim())
+    .filter((c) => /^\d{4}$/.test(c)))];
+  if (!list.length) return { error: "Provide at least one cycle — a 4-digit year or 'auto' (current cycle)." };
+  bulkJob.running = true; bulkJob.startedAt = Date.now(); bulkJob.cycles = list; bulkJob.oth = !!oth; bulkJob.log = [];
+  const args = [path.join(__dirname, "..", "scripts", "import-fec-bulk.js"), "--cycles", list.join(",")];
+  if (oth) args.push("--oth");
+  const child = spawn(process.execPath, args, { cwd: path.join(__dirname, "..") });
+  child.stdout.on("data", bulkLogPush);
+  child.stderr.on("data", bulkLogPush);
+  const finish = (ok, extra) => {
+    bulkJob.running = false;
+    settingSet("bulkLast", JSON.stringify({
+      at: Date.now(), ok, seconds: Math.round((Date.now() - bulkJob.startedAt) / 1000),
+      cycles: list, oth: !!oth, trigger,
+      summary: bulkJob.log.filter((l) => /^(cm|cn|pas2|oth)\d+: |^done /.test(l)).slice(-6).join(" · ") || bulkJob.log.slice(-2).join(" · "),
+      ...(extra || {}),
+    }));
+  };
+  let done = false; // spawn failures fire BOTH 'error' and 'close'
+  child.on("close", (code) => { if (done) return; done = true; finish(code === 0, code === 0 ? {} : { error: `exit code ${code}` }); });
+  child.on("error", (e) => { if (done) return; done = true; finish(false, { error: e.message }); });
+  return { ok: true };
+}
+
+// scheduler sweep: every 10 minutes, start a run if one is due
+setInterval(() => {
+  try {
+    const sched = bulkSchedGet();
+    if (!sched.enabled || bulkJob.running) return;
+    const next = bulkNextAt();
+    if (next && Date.now() >= next) {
+      settingSet("bulkSchedule", JSON.stringify({ ...sched, lastScheduledAt: Date.now() }));
+      startBulkImport({
+        cycles: sched.cycles?.length ? sched.cycles : ["auto"],
+        oth: sched.oth !== false, trigger: "schedule",
+      });
+    }
+  } catch (e) { console.warn("[bulk-schedule]", e.message); }
+}, 600_000).unref();
+
+app.get("/api/admin/bulk-import", (_req, res) => {
+  const sched = bulkSchedGet();
+  res.json({
+    running: bulkJob.running,
+    ...(bulkJob.running ? { startedAt: bulkJob.startedAt, cycles: bulkJob.cycles, oth: bulkJob.oth } : {}),
+    log: bulkJob.log.slice(-12),
+    last: bulkLastGet(),
+    schedule: {
+      enabled: !!sched.enabled, everyHours: Math.max(6, Number(sched.everyHours) || 168),
+      cycles: sched.cycles?.length ? sched.cycles : ["auto"], // "auto" = current cycle, rolls over by itself
+      oth: sched.oth !== false, nextAt: bulkNextAt(),
+    },
+    stats: { ...contribStats(), ...fecRefStats() },
+  });
+});
+
+app.post("/api/admin/bulk-import", (req, res) => {
+  const cycles = Array.isArray(req.body?.cycles) ? req.body.cycles : String(req.body?.cycles || "").split(",");
+  const r = startBulkImport({ cycles, oth: !!req.body?.oth, trigger: "manual" });
+  if (r.error) return res.status(409).json({ error: { message: r.error } });
+  res.json({ ok: true });
+});
+
+app.post("/api/admin/bulk-schedule", (req, res) => {
+  const enabled = !!req.body?.enabled;
+  const everyHours = Math.max(6, Math.min(720, Number(req.body?.everyHours) || 168));
+  const cycles = (Array.isArray(req.body?.cycles) ? req.body.cycles : String(req.body?.cycles || "").split(","))
+    .map((s) => String(s).trim().toLowerCase()).filter((c) => c === "auto" || /^\d{4}$/.test(c));
+  const sched = {
+    enabled, everyHours,
+    cycles: cycles.length ? cycles : ["auto"], // stored as "auto" so the schedule rolls to new cycles
+    oth: req.body?.oth !== false,
+    lastScheduledAt: enabled ? Date.now() : null, // next run = enable time + interval
+  };
+  settingSet("bulkSchedule", JSON.stringify(sched));
+  res.json({ ok: true, schedule: { ...sched, nextAt: enabled ? sched.lastScheduledAt + everyHours * 3_600_000 : null } });
+});
+
+// ---- admin: consolidated source/connection status ----
+// One feed for the Admin panel's Connections section: FEC API key state, TREF reachability,
+// web-search config, and per-bulk-file freshness. Bulk freshness compares the FEC's
+// Last-Modified header (HEAD request, no download) against the local cached zip's mtime —
+// the honest "is there new data?" answer, not a guess. Cached 10 min; ?fresh=1 re-checks.
+app.get("/api/admin/sources", async (req, res) => {
+  const ck = "admin:sources:v1";
+  if (qstr(req.query.fresh) !== "1") {
+    const hit = cacheGetWithAge(ck);
+    if (hit) return res.json({ ...hit.value, cachedAt: hit.createdAt });
+  }
+  const sched = bulkSchedGet();
+  const cyclesRaw = sched.cycles?.length ? sched.cycles : ["auto"];
+  const cycles = [...new Set(cyclesRaw.map((c) => (String(c).toLowerCase() === "auto" ? String(currentCycle()) : String(c))))]
+    .filter((c) => /^\d{4}$/.test(c));
+  const kinds = ["cm", "cn", "ccl", "pas2", ...(sched.oth !== false ? ["oth"] : [])];
+  const dataDir = process.env.DATA_DIR || path.join(__dirname, "..", "data");
+  // all checks run in PARALLEL — one slow/hung source must not stack timeouts serially
+  const checkOne = async (cycle, kind) => {
+    const yy = cycle.slice(2);
+    const url = `https://www.fec.gov/files/bulk-downloads/${cycle}/${kind}${yy}.zip`;
+    let local = null;
+    try {
+      const st = fs.statSync(path.join(dataDir, "bulk", `${kind}${yy}.zip`));
+      if (st.size > 0) local = { mtime: st.mtimeMs, size: st.size };
+    } catch { /* not downloaded yet */ }
+    let remote = null, error = null;
+    try {
+      const r = await fetch(url, { method: "HEAD", signal: AbortSignal.timeout(8000) });
+      if (!r.ok) error = `HTTP ${r.status}`;
+      else remote = {
+        size: Number(r.headers.get("content-length")) || null,
+        lastModified: r.headers.get("last-modified") ? Date.parse(r.headers.get("last-modified")) : null,
+      };
+    } catch (e) { error = e.message; }
+    const verdict = error ? "unreachable"
+      : !local ? "not downloaded"
+      : remote?.lastModified && remote.lastModified > local.mtime ? "new data available"
+      : "up to date";
+    return { kind, cycle, url, remote, local, ...(error ? { error } : {}), verdict };
+  };
+  const pairs = cycles.flatMap((cycle) => kinds.map((kind) => [cycle, kind]));
+  const [bulk, tn] = await Promise.all([
+    Promise.all(pairs.map(([cycle, kind]) => checkOne(cycle, kind))),
+    tnHealth().catch((e) => ({ ok: false, error: e.message })),
+  ]);
+  const out = {
+    at: Date.now(),
+    fec: { keyConfigured: FEC_API_KEY !== "DEMO_KEY" },
+    tn,
+    search: { provider: searchProvider(), configured: searchConfigured() },
+    bulk,
+  };
+  cacheSet(ck, out, 10 * 60 * 1000);
+  res.json(out);
+});
+
+// ---- admin: database backup (WAL checkpoint + timestamped copy in data/backups) ----
+app.post("/api/admin/backup", (_req, res) => {
+  const r = dbBackup();
+  if (r.error) return res.status(500).json({ error: { message: r.error } });
+  res.json(r);
+});
+
 // ---- admin: clear cache ----
 app.post("/api/admin/clear-cache", (_req, res) => {
   const ok = cacheFlush();
@@ -2872,7 +3577,16 @@ app.get("/api/admin/status", (_req, res) => {
     memory: { heapUsedMB: (process.memoryUsage().heapUsed / 1e6).toFixed(1), rssMB: (process.memoryUsage().rss / 1e6).toFixed(1) },
     node: process.version,
     districts: { files: districtFiles },
+    storage: dbStorageStats(),
+    fecGateway: { ...fecStats, inflight: fecInflight.size, blockedForSec: Math.max(0, Math.ceil((fecBlockedUntil - Date.now()) / 1000)) },
   });
+});
+
+// ---- admin: compact the database (drop long-expired cache rows, VACUUM, refresh planner stats) ----
+app.post("/api/admin/compact", (_req, res) => {
+  const r = dbCompact();
+  if (r.error) return res.status(500).json({ error: { message: r.error } });
+  res.json(r);
 });
 
 // ---- AI: spending (Schedule B) analysis ----
@@ -3040,6 +3754,7 @@ async function executeAskTool(name, args, ctx) {
     if (name === "fec_outside_money") {
       if (!ctx.candidateId) return { note: "No candidate id available." };
       const d = await fecFetch("schedules/schedule_e/", { candidate_id: ctx.candidateId, two_year_transaction_period: cycle, sort: "-expenditure_amount", per_page: "100" });
+      ingestScheduleE(d.results); // permanent capture
       const m = {};
       let totalSupport = 0, totalOppose = 0;
       for (const r of d.results || []) {
@@ -3803,13 +4518,19 @@ Write a 150-220 word analysis of where the money comes from and where it goes: n
   }
 });
 
+// ---- Tennessee explorer: directory, full C&E search, report search, federal dollars ----
+registerTnExplorer(app, { fecFetch, moneySearch, wantsRefresh, TTL, normalizeDonorKey, normDate, ingestScheduleA, tnLedgerData });
+
 // unknown API routes get a JSON 404, never the SPA shell
 app.all("/api/*", (req, res) => res.status(404).json({ error: { message: `No such endpoint: ${req.method} ${req.path}` } }));
 
 // ---- static frontend ----
 const dist = path.join(__dirname, "..", "dist");
-app.use(express.static(dist));
-app.get("*", (_req, res) => res.sendFile(path.join(dist, "index.html")));
+// Hashed bundles under /assets never change for a given filename → cache for a year. index.html is
+// always revalidated so a rebuild is picked up on the next load.
+app.use("/assets", express.static(path.join(dist, "assets"), { immutable: true, maxAge: "365d", fallthrough: true }));
+app.use(express.static(dist, { setHeaders: (res, file) => { if (file.endsWith(".html")) res.setHeader("Cache-Control", "no-cache"); } }));
+app.get("*", (_req, res) => { res.setHeader("Cache-Control", "no-cache"); res.sendFile(path.join(dist, "index.html")); });
 
 // last-resort error handler: never leak a stack trace as HTML
 // eslint-disable-next-line no-unused-vars

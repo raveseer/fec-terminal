@@ -1,4 +1,4 @@
-# FEC Records Terminal v4
+# FEC Records Terminal v4.1
 
 Self-hosted explorer for the OpenFEC API with local-AI donor analysis and Tennessee
 state-records search.
@@ -27,9 +27,27 @@ state-records search.
   are cached + force-refreshable. Needs a tool-capable model (`OLLAMA_TOOL_MODEL`, default
   `mistral-small3.2:latest`, selectable in Admin); web search is optional (`SEARCH_API_KEY`) and
   degrades to FEC/TN/Wikipedia/news when unset.
-- **TN State tab** — searches the Tennessee Registry of Election Finance (apps.tn.gov/tncamp)
-  for state candidates, PACs, and judicial races the FEC never sees, with per-entity report
-  lists. Requests are serialized and rate-spaced to be polite to the state site.
+- **Tennessee tab** — seven ways into Tennessee money, all sharing one cache:
+  - *Candidate donors* — type a name, pick the matching federal committees and state account,
+    and get one merged donor list (federal $ / state $ / total per donor, CSV export). Federal
+    rows are pulled from Schedule A largest-first in a resumable background job; state rows come
+    from the account's filed reports (TREF's own contribution search stops at 500 rows).
+  - *Registry* — per-entity workspace on the Tennessee Registry of Election Finance (TREF,
+    apps.tn.gov/tncamp): report lists, itemized ledgers, money flows, AI profiles, tracking.
+    Name search is a single `%wildcard` contains-match; filters for office, district, party,
+    election year and primary/general winners.
+  - *Directory* — a local index of every candidate and PAC TREF returns (name, treasurer,
+    officers, address, results, open/closed). Substring search with zero calls to the state
+    site. "Sync current cycles" / "Sync every year since 2002" fill it; closed years are
+    fetched once and never again.
+  - *Money search* — the full TREF contributions/expenditures form: contributor, recipient,
+    employer, occupation, ZIP, vendor, purpose, amount, type (incl. independent expenditures),
+    report type, several report years at once, with top-contributor/recipient/vendor rollups.
+  - *Filings* — TREF's report search: every filing of a type/year by office, district or party.
+  - *Federal races* — FEC totals for every Tennessee U.S. Senate/House candidate in one call.
+  - *Federal dollars* — USAspending.gov contracts, grants, loans and direct payments by
+    Tennessee county or congressional district: recipients, agencies, programs, largest awards.
+  Requests to the state site are serialized and rate-spaced.
 
 ## Deploy
 
@@ -69,14 +87,35 @@ If the header shows "ollama offline":
 | `OLLAMA_TIMEOUT_MS` | `600000` | Analysis timeout (cold model loads are slow) |
 | `PORT` | `3000` | Container listen port |
 | `CACHE_TTL_MS` | `21600000` (6h) | FEC response cache lifetime |
-| `TN_CACHE_TTL_MS` | `86400000` (24h) | TN registry cache lifetime |
+| `TN_CACHE_TTL_MS` | `86400000` (24h) | TN registry cache lifetime (open report years) |
+| `CACHE_STALE_GRACE_MS` | `1209600000` (14d) | How long expired responses stay available as an outage fallback |
+| `TN_SESSION_TTL_MS` | `480000` (8m) | How long a warm TREF session is reused |
 | `DATA_DIR` | `./data` | SQLite cache + settings location |
 | `FEC_FETCH_TIMEOUT_MS` | `20000` | Upstream FEC request timeout |
 
 ## Caching & settings
 
-All upstream responses (FEC, TN registry, Wikipedia, news, federal cross-refs) are cached in
-SQLite at `DATA_DIR/fec-terminal.db`, checked before every API call. The cache and the model
+Every upstream call goes through a cached gateway — nothing is fetched twice while a good copy
+exists:
+
+- **One key per logical request** (path + sorted params, API key excluded), shared by the
+  browser proxy and the server-side tools.
+- **Cycle-aware lifetimes** — current-cycle FEC data 6 h, the previous cycle 3 days, older
+  cycles 14 days; TREF searches 1 day for open report years, 30 days for closed ones.
+- **Coalescing** — identical requests already in flight share a single upstream call.
+- **Stale-if-error** — expired rows are kept 14 days (`CACHE_STALE_GRACE_MS`) and served,
+  flagged, when the FEC or TREF is down or rate-limiting. After an FEC 429 the gateway waits
+  out `Retry-After` instead of hammering the API.
+- **↺ Refresh** bypasses the cache, but only for data that can still change.
+- TREF report details are stored permanently; a warm TREF session is reused across report
+  fetches (one request per report instead of four).
+- Responses are compressed (brotli/gzip), hashed assets are cached for a year, district
+  GeoJSON is streamed from disk with ETags, and fonts are bundled (no Google Fonts request).
+
+Admin shows cache hit rate, stale-fallback rows, reclaimable space, and has **Compact DB**
+(VACUUM). `npm test` runs the storage/search tests against a throwaway database.
+
+All of it lives in SQLite at `DATA_DIR/fec-terminal.db`. The cache and the model
 setting survive container rebuilds via the `./data` volume mount. Wikipedia entries live 7 days,
 news 1 hour, federal lookups 1 day. The AI model is selectable from the dropdown in the page
 header — the choice is stored in SQLite and persists until changed (`OLLAMA_MODEL` env is just
@@ -101,6 +140,13 @@ the initial default).
 - `/api/tn/money?name=&electionYear=&reportYear=` — three TREF ledger searches per entity:
   contributions received (who funds them), contributions given (who they fund), and
   expenditures (vendors & purposes), sorted by amount, capped at 300 rows per section
+- `/api/tn/meta` (live election years/offices/parties/report types), `/api/tn/districts?office=`
+- `/api/tn/directory?q=&kind=&office=&district=&party=&year=&city=&zip=&winner=&open=` — local
+  directory search; `GET|POST /api/tn/directory/sync` — status / start a sync (`{scope: "current"|"all"}`)
+- `/api/tn/explore/money?kind=&years=2026,2025&contributor=&recipient=&employer=&occupation=&zip=&by=&vendor=&vendorZip=&purpose=&typeOf=&amountOp=&amount=&reportTypes=`
+- `/api/tn/explore/reports?reportYear=&name=&for=&office=&district=&party=&electionYear=&reportTypes=`
+- `/api/tn/federal/races?cycle=` — FEC totals for every TN federal candidate, grouped by race
+- `/api/tn/federal/spending/geo|summary|awards?fy=&county=&district=&group=&q=` — USAspending
 - `/api/health`, `/api/ollama/health` — Homepage-widget friendly
 
 Analyze endpoints are rate-limited to 10 req/min per IP; the FEC proxy to 120 req/min.

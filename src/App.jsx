@@ -1,5 +1,7 @@
 import { useState, useEffect, useCallback, useMemo, useRef, Fragment } from "react";
 import { createPortal } from "react-dom";
+import { css } from "./styles.js";
+import TennesseeHub from "./Tennessee.jsx";
 
 // ---------- constants ----------
 const STATES = [
@@ -306,6 +308,67 @@ function _sourcesHtml(sources) {
     `<div class="src"><a href="${escHtml(safeUrl(s.url))}"><span class="k">${escHtml(s.kind || "src")}</span>${escHtml(s.title || s.url)}</a></div>`).join("");
 }
 
+// Money-flow bubble map for dossiers: top donors → entity → top expenditures. Static SVG string
+// (print-safe); `dark` flips the palette for the on-screen modal. Bubble size and edge weight
+// scale with √dollars. Returns "" when there's nothing to draw.
+function _flowBubblesHTML(centerName, donorsIn = [], vendorsOut = [], { dark = false } = {}) {
+  const donors = (donorsIn || []).filter((x) => x && (Number(x.amount) || 0) > 0).slice(0, 10);
+  const vendors = (vendorsOut || []).filter((x) => x && (Number(x.amount) || 0) > 0).slice(0, 10);
+  if (!donors.length && !vendors.length) return "";
+  const C = dark
+    ? { inn: "#8A9A5B", out: "#b3544a", center: "#C8B560", label: "#E9E5D6", sub: "#9AA083", inAmt: "#8A9A5B", outAmt: "#b3544a", title: "#E9E5D6" }
+    : { inn: "#7a9a4b", out: "#b3544a", center: "#1a5c2e", label: "#333333", sub: "#666666", inAmt: "#1a5c2e", outAmt: "#8a3a32", title: "#111111" };
+  const rows = Math.max(donors.length, vendors.length, 1);
+  const W = 820, rowH = 52, H = Math.max(300, rows * rowH + 60);
+  const cx = W / 2, cy = H / 2;
+  const maxAmt = Math.max(...donors.map((d) => Number(d.amount) || 0), ...vendors.map((v) => Number(v.amount) || 0), 1);
+  const rad = (a) => 8 + 18 * Math.sqrt((Number(a) || 0) / maxAmt);
+  const wid = (a) => 1 + 5 * Math.sqrt((Number(a) || 0) / maxAmt);
+  const trunc = (s, n = 26) => { const t = String(s || ""); return t.length > n ? `${t.slice(0, n - 1)}…` : t; };
+  const place = (list, x, side) => list.map((it, i) => {
+    const step = list.length > 1 ? Math.min(rowH, (H - 90) / (list.length - 1)) : 0;
+    const y = cy - (step * (list.length - 1)) / 2 + i * step;
+    return { ...it, x, y, r: rad(it.amount), side };
+  });
+  const L = place(donors, 230, -1), R = place(vendors, W - 230, 1);
+  const paths = [
+    ...L.map((n) => `<path d="M ${(n.x + n.r).toFixed(1)} ${n.y.toFixed(1)} C ${((n.x + cx) / 2).toFixed(1)} ${n.y.toFixed(1)}, ${((n.x + cx) / 2).toFixed(1)} ${cy}, ${cx - 36} ${cy}" fill="none" stroke="${C.inn}" stroke-opacity=".45" stroke-width="${wid(n.amount).toFixed(1)}"/>`),
+    ...R.map((n) => `<path d="M ${cx + 36} ${cy} C ${((n.x + cx) / 2).toFixed(1)} ${cy}, ${((n.x + cx) / 2).toFixed(1)} ${n.y.toFixed(1)}, ${(n.x - n.r).toFixed(1)} ${n.y.toFixed(1)}" fill="none" stroke="${C.out}" stroke-opacity=".4" stroke-width="${wid(n.amount).toFixed(1)}"/>`),
+  ].join("");
+  const bubble = (n, fill, amtColor) =>
+    `<circle cx="${n.x}" cy="${n.y.toFixed(1)}" r="${n.r.toFixed(1)}" fill="${fill}" fill-opacity=".85"/>` +
+    `<text x="${(n.x + n.side * (n.r + 8)).toFixed(1)}" y="${(n.y - 2).toFixed(1)}" text-anchor="${n.side < 0 ? "end" : "start"}" font-size="10" fill="${C.label}">${escHtml(trunc(n.name))}</text>` +
+    `<text x="${(n.x + n.side * (n.r + 8)).toFixed(1)}" y="${(n.y + 10).toFixed(1)}" text-anchor="${n.side < 0 ? "end" : "start"}" font-size="9" font-weight="700" fill="${amtColor}">${_fmtK(n.amount)}</text>`;
+  const sumIn = donors.reduce((a, x) => a + (Number(x.amount) || 0), 0);
+  const sumOut = vendors.reduce((a, x) => a + (Number(x.amount) || 0), 0);
+  return `<svg viewBox="0 0 ${W} ${H}" width="100%" style="max-width:${W}px" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Money flow map">
+    <text x="230" y="18" text-anchor="middle" font-size="9" letter-spacing="2" fill="${C.sub}">TOP DONORS IN</text>
+    <text x="${W - 230}" y="18" text-anchor="middle" font-size="9" letter-spacing="2" fill="${C.sub}">TOP EXPENDITURES OUT</text>
+    ${paths}
+    ${L.map((n) => bubble(n, C.inn, C.inAmt)).join("")}
+    ${R.map((n) => bubble(n, C.out, C.outAmt)).join("")}
+    <circle cx="${cx}" cy="${cy}" r="30" fill="${C.center}"/>
+    <text x="${cx}" y="${cy - 40}" text-anchor="middle" font-size="12" font-weight="800" fill="${C.title}">${escHtml(trunc(centerName, 34))}</text>
+    <text x="${cx}" y="${cy + 52}" text-anchor="middle" font-size="9" fill="${C.sub}">in ${_fmtK(sumIn)} · out ${_fmtK(sumOut)} (top-10s only)</text>
+  </svg>`;
+}
+
+// The dossier's "money flow" page: bubble map + the two top-10 lists side by side (print HTML).
+function _flowPageHTML(centerName, donors, vendors) {
+  const svg = _flowBubblesHTML(centerName, donors, vendors);
+  if (!svg) return "";
+  const tbl = (list, title, nameHdr) => (list || []).length
+    ? `<div style="flex:1 1 300px; min-width:250px;"><div class="ai-label">${title}</div><table><thead><tr><th>${nameHdr}</th><th class="amt">Total</th></tr></thead><tbody>` +
+      list.slice(0, 10).map((x) => `<tr><td>${escHtml(x.name)}</td><td class="amt">${_fmtDossD(x.amount)}</td></tr>`).join("") +
+      `</tbody></table></div>` : "";
+  return `<h2 class="sec" style="page-break-before:always">Money flow map</h2>
+    <div class="note">Largest itemized donors (left, green) and largest expenditure recipients (right, red) — bubble size and line weight scale with dollars. Conduit pass-throughs are excluded upstream; unitemized small-dollar money is not shown.</div>
+    ${svg}
+    <div style="display:flex; gap:16px; flex-wrap:wrap; margin-top:8px; page-break-inside:avoid;">
+      ${tbl(donors, "Top 10 donors", "Donor")}${tbl(vendors, "Top 10 expenditures", "Recipient")}
+    </div>`;
+}
+
 function buildDossierHTML(d, mapHtml = "") {
   if (d.kind === "tn") {
     let body = "";
@@ -338,6 +401,7 @@ function buildDossierHTML(d, mapHtml = "") {
         body += `<div class="ai-label">Largest vendors</div><table><thead><tr><th>Vendor</th><th>Payments</th><th class="amt">Total</th></tr></thead><tbody>` +
           m.topVendors.map((x) => `<tr><td>${escHtml(x.name)}</td><td>${x.count}</td><td class="amt">${_fmtDossD(x.amount)}</td></tr>`).join("") + `</tbody></table>`;
       }
+      body += _flowPageHTML(d.entity.name, m.topDonors, m.topVendors);
     } else if (d.moneyError) {
       body += `<h2 class="sec">Money flows</h2><div class="note">Money flows unavailable: ${escHtml(d.moneyError)}</div>`;
     }
@@ -416,6 +480,8 @@ function buildDossierHTML(d, mapHtml = "") {
       d.spending.top_recipients.slice(0, 10).map((r) => `<tr><td>${escHtml(r.name)}</td><td class="amt">${_fmtDossD(r.amount)}</td></tr>`).join("") + `</tbody></table>`;
   }
 
+  body += _flowPageHTML(c.name, d.donors?.topDonors, d.spending?.top_recipients);
+
   if (d.outside && (d.outside.total_spent_FOR_candidate || d.outside.total_spent_AGAINST_candidate)) {
     body += `<h2 class="sec">Outside money (Schedule E)</h2>
       <div style="font-size:12px">Spent <b>FOR</b> this candidate: ${_fmtDossD(d.outside.total_spent_FOR_candidate)} &nbsp;·&nbsp; Spent <b>AGAINST</b>: ${_fmtDossD(d.outside.total_spent_AGAINST_candidate)}</div>`;
@@ -435,247 +501,6 @@ function buildDossierHTML(d, mapHtml = "") {
 }
 
 // ---------- styles ----------
-const css = `
-  @import url('https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap');
-
-  * { box-sizing: border-box; }
-  body { margin: 0; }
-  /* theme vars on :root so portaled modals (rendered on <body>) resolve them too */
-  :root {
-    --ink:#15170F; --panel:#1D2016; --panel2:#232719; --line:#3A3F2C;
-    --bone:#E9E5D6; --muted:#9AA083; --brass:#C8B560; --olive:#8A9A5B;
-    --sub:#9AA083; --border:#3A3F2C; --rose:#b3544a; --danger:#b3544a;
-  }
-  .fec-root {
-    min-height:100vh; background:var(--ink); color:var(--bone);
-    font-family:'IBM Plex Mono', ui-monospace, Menlo, monospace;
-    font-size:13px; line-height:1.5;
-  }
-  .fec-wrap { max-width:1080px; margin:0 auto; padding:32px 20px 64px; box-sizing:border-box; }
-  @media (max-width:520px) {
-    .fec-wrap { padding:16px 12px 48px; }
-    .fec-head { flex-direction:column; gap:8px; }
-    .fec-health { text-align:left; }
-  }
-
-  .fec-head { display:flex; justify-content:space-between; align-items:flex-start; gap:16px; flex-wrap:wrap; }
-  .fec-eyebrow { color:var(--olive); letter-spacing:.18em; font-size:11px; text-transform:uppercase; }
-  .fec-title {
-    font-family:'Barlow Condensed', 'Arial Narrow', sans-serif;
-    font-weight:700; font-size:clamp(34px, 6vw, 56px); line-height:.95;
-    text-transform:uppercase; letter-spacing:.01em; color:var(--bone); margin:6px 0 2px;
-  }
-  .fec-title em { font-style:normal; color:var(--brass); }
-  .fec-sub { color:var(--muted); max-width:560px; }
-  .fec-health { font-size:11px; color:var(--muted); text-align:right; padding-top:8px; line-height:1.8; }
-  .fec-dot { display:inline-block; width:8px; height:8px; border-radius:50%; margin-right:6px; }
-  .fec-modelsel {
-    background:var(--ink); color:var(--bone); border:1px solid var(--line);
-    font:inherit; font-size:11px; padding:1px 4px; max-width:160px;
-  }
-
-  .fec-controls {
-    margin-top:24px; background:var(--panel); border:1px solid var(--line);
-    border-top:2px solid var(--brass); padding:18px;
-    display:grid; grid-template-columns:repeat(auto-fit, minmax(150px, 1fr)); gap:14px;
-  }
-  .fec-field label { display:block; font-size:10px; letter-spacing:.14em; text-transform:uppercase; color:var(--muted); margin-bottom:5px; }
-  .fec-field select {
-    width:100%; background:var(--ink); color:var(--bone);
-    border:1px solid var(--line); border-radius:0; padding:8px 10px; font:inherit; font-size:13px;
-  }
-  .fec-field select:focus-visible, button:focus-visible, .fec-check input:focus-visible {
-    outline:2px solid var(--brass); outline-offset:1px;
-  }
-  .fec-field select:disabled { opacity:.35; }
-
-  .fec-actions { grid-column:1 / -1; display:flex; align-items:center; gap:16px; flex-wrap:wrap; }
-  .fec-btn {
-    background:var(--brass); color:#1A180F; border:none; padding:10px 26px;
-    font-family:'Barlow Condensed', sans-serif; font-weight:700; font-size:16px;
-    letter-spacing:.1em; text-transform:uppercase; cursor:pointer;
-  }
-  .fec-btn:hover { background:#D9C77A; }
-  .fec-btn:disabled { opacity:.45; cursor:default; }
-  .fec-btn.ghost { background:none; border:1px solid var(--line); color:var(--bone); font-size:13px; padding:7px 16px; }
-  .fec-btn.ghost:hover { border-color:var(--brass); color:var(--brass); }
-  .fec-check { color:var(--muted); font-size:12px; display:flex; align-items:center; gap:7px; cursor:pointer; user-select:none; }
-  .fec-check input { accent-color:var(--brass); }
-  .fec-hint { color:var(--muted); font-size:11px; max-width:420px; }
-
-  .fec-tabs { margin-top:26px; display:flex; border-bottom:1px solid var(--line);
-    overflow-x:auto; -webkit-overflow-scrolling:touch; scrollbar-width:none; }
-  .fec-tabs::-webkit-scrollbar { display:none; }
-  .fec-tab {
-    background:none; border:none; color:var(--muted); font:inherit;
-    font-family:'Barlow Condensed', sans-serif; font-weight:600; font-size:16px;
-    letter-spacing:.08em; text-transform:uppercase; padding:8px 18px; cursor:pointer;
-    border-bottom:2px solid transparent; margin-bottom:-1px; white-space:nowrap; flex-shrink:0;
-  }
-  .fec-tab[aria-selected="true"] { color:var(--brass); border-bottom-color:var(--brass); }
-
-  .fec-status { margin-top:16px; color:var(--muted); display:flex; justify-content:space-between; gap:12px; flex-wrap:wrap; font-size:12px; align-items:center; }
-  .fec-error { margin-top:22px; border:1px solid #7A4A3C; background:#2A1D17; color:#E0B8A8; padding:12px 14px; }
-
-  .fec-card { border:1px solid var(--line); border-left:4px solid var(--pc, var(--muted)); background:var(--panel); margin-top:10px; }
-  .fec-row-btn {
-    width:100%; display:flex; align-items:baseline; gap:14px; flex-wrap:wrap;
-    background:none; border:none; color:inherit; font:inherit; text-align:left;
-    padding:12px 14px; cursor:pointer;
-  }
-  .fec-row-btn:hover { background:var(--panel2); }
-  .fec-name { font-family:'Barlow Condensed', sans-serif; font-weight:600; font-size:19px; letter-spacing:.02em; }
-  .fec-tag { font-size:11px; color:var(--muted); }
-  .fec-id { margin-left:auto; font-size:11px; color:var(--olive); }
-  .fec-inc { color:var(--brass); font-size:11px; letter-spacing:.08em; text-transform:uppercase; }
-
-  .fec-drawer { border-top:1px dashed var(--line); padding:14px; display:grid;
-    grid-template-columns:repeat(auto-fit, minmax(160px, 1fr)); gap:12px; background:var(--panel2); }
-  .fec-stat b { display:block; font-size:10px; letter-spacing:.12em; text-transform:uppercase; color:var(--muted); font-weight:500; }
-  .fec-stat span { font-size:15px; }
-  .fec-stat .pos { color:var(--brass); }
-  .fec-drawer-actions { grid-column:1/-1; display:flex; gap:10px; }
-
-  .fec-race { margin-top:14px; }
-  .fec-race-row { display:grid; grid-template-columns:minmax(150px, 230px) 1fr auto; gap:12px; align-items:center;
-    padding:10px 0; border-bottom:1px solid var(--line); }
-  .fec-race-name { font-family:'Barlow Condensed', sans-serif; font-weight:600; font-size:17px; line-height:1.15; }
-  .fec-race-name small { display:block; font-family:'IBM Plex Mono', monospace; font-weight:400; font-size:10px; color:var(--muted); text-transform:uppercase; letter-spacing:.08em; }
-  .fec-bars { display:grid; gap:5px; min-width:0; }
-  .fec-barline { display:grid; grid-template-columns:1fr 70px; gap:8px; align-items:center; }
-  .fec-bartrack { background:var(--ink); border:1px solid var(--line); height:16px; position:relative; overflow:hidden; }
-  .fec-barfill { position:absolute; top:0; bottom:0; left:0; min-width:2px; max-width:100%; }
-  .fec-barfill.coh { background:repeating-linear-gradient(45deg, var(--pc), var(--pc) 4px, transparent 4px, transparent 7px); border-right:2px solid var(--pc); }
-  .fec-barfill.rec { background:var(--pc); }
-  .fec-barval { font-size:11px; text-align:right; }
-  .fec-legend { display:flex; gap:18px; margin-top:12px; color:var(--muted); font-size:11px; align-items:center; flex-wrap:wrap; }
-  .fec-sw { display:inline-block; width:14px; height:10px; margin-right:6px; background:var(--muted); }
-  .fec-sw.hatch { background:repeating-linear-gradient(45deg, var(--muted), var(--muted) 4px, transparent 4px, transparent 7px); }
-
-  .fec-pager { margin-top:18px; display:flex; gap:10px; align-items:center; }
-  .fec-pager button { background:var(--panel); border:1px solid var(--line); color:var(--bone); padding:6px 14px; font:inherit; cursor:pointer; }
-  .fec-pager button:disabled { opacity:.3; cursor:default; }
-
-  .fec-empty { margin-top:28px; color:var(--muted); border:1px dashed var(--line); padding:24px; text-align:center; }
-
-  /* ---- donor ledger ---- */
-  .fec-ledger { margin-top:20px; border:1px solid var(--brass); background:var(--panel); }
-  .fec-ledger-head { display:flex; align-items:baseline; gap:14px; flex-wrap:wrap; padding:14px 16px; border-bottom:1px solid var(--line); }
-  .fec-ledger-head .fec-name { font-size:21px; }
-  .fec-ledger-head .close { margin-left:auto; background:none; border:1px solid var(--line); color:var(--muted); font:inherit; padding:4px 12px; cursor:pointer; }
-  .fec-ledger-head .close:hover { color:var(--bone); border-color:var(--bone); }
-  .fec-ledger-bar { display:flex; gap:10px; align-items:center; flex-wrap:wrap; padding:10px 16px; border-bottom:1px solid var(--line); background:var(--panel2); }
-
-  .fec-table-wrap { overflow-x:auto; -webkit-overflow-scrolling:touch; }
-  .fec-flow-scroll { overflow-x:auto; -webkit-overflow-scrolling:touch; }
-  .fec-flow-svg { width:100%; min-width:760px; display:block; }
-  table.fec-table { width:100%; border-collapse:collapse; font-size:12px; }
-  .fec-table th {
-    text-align:left; font-size:10px; letter-spacing:.12em; text-transform:uppercase; font-weight:500;
-    color:var(--muted); padding:8px 12px; border-bottom:1px solid var(--line); white-space:nowrap;
-    position:sticky; top:0; background:var(--panel);
-  }
-  .fec-table td { padding:7px 12px; border-bottom:1px solid #2A2E1E; vertical-align:top; }
-  .fec-table td.amt { text-align:right; color:var(--brass); white-space:nowrap; }
-  .fec-table th.amt { text-align:right; }
-  .fec-table tr:hover td { background:var(--panel2); }
-  .fec-table .sub { color:var(--muted); font-size:11px; }
-  .fec-badge {
-    display:inline-block; margin-left:8px; padding:0 6px; font-size:9px; letter-spacing:.1em;
-    border:1px solid var(--olive); color:var(--olive); vertical-align:middle;
-  }
-  .fec-badge.memo { border-color:var(--muted); color:var(--muted); }
-  .fec-btn.ghost.sm { padding:3px 10px; font-size:11px; letter-spacing:.04em; white-space:nowrap; }
-  .fec-profile-row td { background:var(--panel2); padding:0; }
-  .fec-profile { padding:14px 16px; border-left:3px solid var(--olive); }
-  .fec-profile-identity { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
-  .fec-profile .chip { border:1px solid var(--line); padding:1px 9px; font-size:10px; letter-spacing:.08em; text-transform:uppercase; color:var(--bone); }
-  .fec-profile .chip.brass { border-color:var(--brass); color:var(--brass); }
-  .fec-funders { margin:4px 0 0; padding:0; list-style:none; font-size:11px; max-width:560px; }
-  .fec-funders li { display:flex; justify-content:space-between; gap:10px; padding:2px 0; border-bottom:1px dotted #2A2E1E; }
-  .fec-funders li b { font-weight:400; color:var(--brass); white-space:nowrap; }
-  .fec-profile-links { margin-top:12px; display:flex; gap:16px; flex-wrap:wrap; }
-  .fec-profile-links a { color:var(--olive); font-size:12px; text-decoration:none; border-bottom:1px dotted var(--olive); }
-  .fec-profile-links a:hover { color:var(--brass); border-color:var(--brass); }
-
-  /* ---- AI panel ---- */
-  .fec-ai { border-top:2px solid var(--olive); background:var(--panel2); padding:16px; }
-  .fec-ai-label { color:var(--olive); letter-spacing:.16em; font-size:10px; text-transform:uppercase; margin-bottom:8px; }
-  .fec-ai-text { white-space:pre-wrap; max-width:75ch; }
-  .fec-ai-caveat { font-size:11px; color:var(--muted); font-style:italic; line-height:1.5; margin:-2px 0 10px; max-width:75ch; }
-  .fec-ask { margin-top:14px; border:1px solid var(--line); border-left:3px solid var(--brass); background:var(--panel2); padding:14px 16px; }
-  .fec-ask-bar { display:flex; gap:8px; align-items:center; }
-  .fec-ask-input { flex:1; background:var(--ink); color:var(--bone); border:1px solid var(--line); padding:9px 12px; font:inherit; font-size:13px; }
-  .fec-ask-input:focus { outline:2px solid var(--brass); outline-offset:1px; }
-  .fec-ask-suggest { display:flex; flex-wrap:wrap; gap:6px; margin-top:10px; }
-  .fec-chip { background:none; border:1px solid var(--line); color:var(--muted); font:inherit; font-size:11px; padding:4px 10px; cursor:pointer; border-radius:3px; text-align:left; line-height:1.3; }
-  .fec-chip:hover { border-color:var(--brass); color:var(--brass); }
-  .fec-ask-trace { margin-top:10px; font-size:11px; color:var(--muted); display:flex; flex-direction:column; gap:3px; font-family:'IBM Plex Mono', monospace; }
-  .fec-ask-tool { color:var(--olive); }
-  .fec-ask-status { margin-top:8px; font-size:10.5px; color:var(--muted); letter-spacing:.04em; display:flex; align-items:center; }
-  .fec-extlink { color:var(--olive); text-decoration:none; white-space:nowrap; }
-  .fec-extlink:hover { color:var(--brass); text-decoration:underline; }
-  .fec-dossier { display:inline-flex; align-items:center; gap:8px; flex-wrap:wrap; }
-  .fec-dossier-msg { font-size:10.5px; color:var(--muted); }
-  .fec-modal-overlay { position:fixed; inset:0; background:rgba(0,0,0,.65); z-index:1000; display:flex; align-items:flex-start; justify-content:center; padding:28px 14px; overflow-y:auto; font-family:'IBM Plex Mono', ui-monospace, Menlo, monospace; font-size:13px; line-height:1.5; color:var(--bone); }
-  .fec-modal { background:var(--panel); border:1px solid var(--brass); border-top:3px solid var(--brass); max-width:900px; width:100%; margin:auto; text-align:left; }
-  .fec-modal-head { display:flex; justify-content:space-between; align-items:center; gap:12px; padding:12px 16px; border-bottom:1px solid var(--line); position:sticky; top:0; background:var(--panel); flex-wrap:wrap; z-index:1; }
-  .fec-modal-body { padding:14px 18px 22px; }
-  .fec-dossier-top { display:flex; gap:16px; align-items:flex-start; flex-wrap:wrap; margin-bottom:10px; }
-  .fec-ask-sources { margin-top:12px; border-top:1px solid var(--line); padding-top:10px; }
-  .fec-ask-source { margin-bottom:9px; }
-  .fec-src-title { color:var(--olive); text-decoration:none; font-size:12px; line-height:1.4; }
-  .fec-src-title:hover { color:var(--brass); }
-  .fec-src-kind { display:inline-block; font-size:9px; text-transform:uppercase; letter-spacing:.08em; color:var(--ink); background:var(--olive); border-radius:2px; padding:1px 5px; margin-right:6px; vertical-align:middle; }
-  .fec-src-snip { font-size:11px; color:var(--muted); line-height:1.45; margin-top:3px; max-width:80ch; }
-  .fec-ai-aggs { margin-top:14px; display:grid; grid-template-columns:repeat(auto-fit, minmax(220px, 1fr)); gap:14px; }
-  .fec-ai-aggs h4 { margin:0 0 6px; font-size:10px; letter-spacing:.12em; text-transform:uppercase; color:var(--muted); font-weight:500; }
-  .fec-ai-aggs ul { margin:0; padding:0; list-style:none; font-size:11px; }
-  .fec-ai-aggs li { display:flex; justify-content:space-between; gap:8px; padding:2px 0; border-bottom:1px dotted #2A2E1E; }
-  .fec-ai-aggs li b { font-weight:400; color:var(--brass); white-space:nowrap; }
-  .fec-spin { color:var(--olive); }
-
-  @media (prefers-reduced-motion: no-preference) {
-    .fec-card, .fec-race-row, .fec-ledger { animation:fecIn .25s ease both; }
-    .fec-barfill { transition:width .4s ease; }
-    @keyframes fecIn { from { opacity:0; transform:translateY(4px); } to { opacity:1; transform:none; } }
-    .fec-spin::after { content:"…"; animation: fecPulse 1.2s infinite; }
-    @keyframes fecPulse { 50% { opacity:.3; } }
-  }
-  @media (max-width: 640px) {
-    .fec-race-row { grid-template-columns:1fr; gap:6px; }
-    .fec-tab { font-size:14px; padding:8px 12px; }
-    .fec-controls { padding:12px; gap:10px; }
-    .fec-btn { padding:9px 18px; font-size:15px; }
-    .fec-ledger-head { padding:10px 12px; gap:8px; }
-    .fec-ledger-head .fec-name { font-size:17px; }
-    .fec-ledger-bar { padding:8px 12px; }
-    .fec-table th, .fec-table td { padding:6px 8px; }
-    .fec-flow-svg { min-width:620px; }
-    .fec-profile { padding:12px; }
-    .fec-ai { padding:12px; }
-    .fec-modal-overlay { padding:10px 6px; }
-    .fec-modal-body { padding:12px 12px 18px; }
-    .fec-hint { max-width:100%; }
-    .fec-status { flex-direction:column; align-items:flex-start; gap:8px; }
-  }
-
-  /* ---------- responsive layout ---------- */
-  .fec-controls-row {
-    display: flex; flex-wrap: wrap; gap: 8px; align-items: center;
-  }
-  .fec-tab-nav {
-    display: flex; gap: 2px; overflow-x: auto; -webkit-overflow-scrolling: touch;
-    scrollbar-width: none; flex-shrink: 0;
-  }
-  .fec-tab-nav::-webkit-scrollbar { display: none; }
-
-  @media (max-width: 600px) {
-    .fec-controls-row { gap: 6px; }
-    .fec-controls-row select, .fec-controls-row input { font-size: 13px !important; }
-  }
-`;
-
 // ---------- shared: AI summary header (label · model · cached-age · refresh) ----------
 // Used by every AI narrative block so the refresh control and cache age look identical
 // across the Money Race, Field, and TN tabs.
@@ -1129,7 +954,7 @@ function DistrictMap({ state, district, cycle, office, onSelect, memberRefreshKe
       <div style={{ display: "flex", flexDirection: "column", gap: 8, paddingTop: 2, minWidth: 140 }}>
         <div style={{ fontSize: 12 }}>
           <span style={{ color: "var(--muted)" }}>District: </span>
-          <span style={{ color: "var(--brass)", fontFamily: "'Barlow Condensed', sans-serif", fontWeight: 700, fontSize: 16 }}>
+          <span style={{ color: "var(--brass)", fontFamily: "'IBM Plex Sans Condensed', sans-serif", fontWeight: 700, fontSize: 16 }}>
             {state}{isAtLarge ? " at-large" : `-${district}`}
           </span>
         </div>
@@ -1193,7 +1018,21 @@ const cacheGet = (map, key) => {
 const cacheSet = (map, key, data) => map.set(key, { ...data, ts: Date.now() });
 
 // ---------- donor ledger component ----------
-function DonorLedger({ target, cycle, raceState, onClose }) {
+// Same normalization as the server's normalizeDonorKey, so ledger-side tracking lands on the
+// identical watchlist key the Donors tab uses.
+const ledgerDonorKey = (g) =>
+  `${String(g.name || "").toUpperCase().replace(/[^A-Z0-9 ]/g, " ").replace(/\s+/g, " ").trim()}|${String(g.state || "").toUpperCase().trim()}`;
+
+function DonorLedger({ target, cycle, raceState, onClose, onDonorInfo }) {
+  const [trackedKeys, setTrackedKeys] = useState({}); // donorKey -> true (optimistic, this ledger only)
+  const trackFromLedger = async (g) => {
+    const donorKey = ledgerDonorKey(g);
+    setTrackedKeys((p) => ({ ...p, [donorKey]: true }));
+    try {
+      await fetch("/api/donors/watch", { method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ donorKey, name: g.name, employer: g.employer || undefined, state: g.state || undefined }) });
+    } catch { setTrackedKeys((p) => ({ ...p, [donorKey]: false })); }
+  };
   const [rows, setRows] = useState([]);
   const [lastIndexes, setLastIndexes] = useState(null);
   const [hasMore, setHasMore] = useState(true);
@@ -2561,10 +2400,24 @@ ${mainHtml}
                       <td className="sub">{fmtDate(g.lastDate)}</td>
                       <td className="amt">{isCommitteeDonor(g) && g.ytdMax ? fmtUSD(g.ytdMax) : "—"}</td>
                       <td className="amt">{fmtUSD(g.total)}</td>
-                      <td>
+                      <td style={{ whiteSpace: "nowrap" }}>
                         <button className="fec-btn ghost sm" onClick={() => profileDonor(g)} aria-expanded={!!pf?.open}>
                           {pf?.loading ? "…" : pf?.open ? "Hide ▾" : "Profile ▸"}
                         </button>
+                        {onDonorInfo && g.name && (
+                          <>
+                            {" "}
+                            <button className="fec-btn ghost sm" onClick={() => onDonorInfo(g.name)}
+                              title="Open this donor in the Donors tab — full cross-candidate giving history, tracking, flows">
+                              Donor ▸
+                            </button>
+                            {" "}
+                            {trackedKeys[ledgerDonorKey(g)]
+                              ? <button className="fec-btn ghost sm" disabled title="On the Donors-tab watchlist">✓</button>
+                              : <button className="fec-btn ghost sm" onClick={() => trackFromLedger(g)}
+                                  title="Add to the donor watchlist — new gifts get flagged in Donors + 🔔 Alerts">☆</button>}
+                          </>
+                        )}
                       </td>
                     </tr>
                     {pf?.open && (
@@ -3101,7 +2954,10 @@ function FlowGraph({ committeeId = "", donorKey = "", name = "", cycle = "", bar
   const [center, setCenter] = useState({ committeeId, donorKey, name });
   const [trail, setTrail] = useState([]); // previous centers, for ◂ Back
   const [st, setSt] = useState({ loading: true }); // {loading} | {data} | {error}
-  const [allCycles, setAllCycles] = useState(!cycle);
+  // scope: "all" | "y:<year-or-cycle>" | "r:<year>|<report name>" (TN reports only).
+  // FEC graphs start scoped to the viewed cycle; TN graphs start at all years.
+  const [scopeSel, setScopeSel] = useState(cycle ? `y:${cycle}` : "all");
+  const [candOnly, setCandOnly] = useState(false); // cleaner view: only candidate-committee flows
   const [tracing, setTracing] = useState(false);
   const [tnPulling, setTnPulling] = useState(false);
   const [sel, setSel] = useState(null); // clicked node/edge → {donorKey?, committeeId?, kind?, label, node?}
@@ -3115,7 +2971,13 @@ function FlowGraph({ committeeId = "", donorKey = "", name = "", cycle = "", bar
       const qs = new URLSearchParams();
       if (c.committeeId) qs.set("committeeId", c.committeeId); else qs.set("donorKey", c.donorKey);
       if (c.name) qs.set("name", c.name);
-      if (!allCycles && cycle) qs.set("cycle", String(cycle));
+      if (scopeSel.startsWith("y:")) qs.set("cycle", scopeSel.slice(2));
+      else if (scopeSel.startsWith("r:")) {
+        const bar = scopeSel.indexOf("|");
+        qs.set("cycle", scopeSel.slice(2, bar));
+        qs.set("report", scopeSel.slice(bar + 1));
+      }
+      if (candOnly) qs.set("candOnly", "1");
       if (trace) qs.set("trace", "1");
       const res = await fetch(`/api/graph?${qs}`);
       const data = await res.json().catch(() => null);
@@ -3127,7 +2989,7 @@ function FlowGraph({ committeeId = "", donorKey = "", name = "", cycle = "", bar
     } finally {
       if (gen === genRef.current) setTracing(false);
     }
-  }, [allCycles, cycle]);
+  }, [scopeSel, candOnly]);
 
   useEffect(() => { setSel(null); setSelRows(null); load(center); }, [center, load]); // new center/cycle scope → stale filter would mislead
 
@@ -3142,7 +3004,12 @@ function FlowGraph({ committeeId = "", donorKey = "", name = "", cycle = "", bar
         if (sel.donorKey) qs.set("donorKey", sel.donorKey);
         if (sel.committeeId) qs.set("committeeId", sel.committeeId);
         if (sel.kind) qs.set("kind", sel.kind);
-        if (!allCycles && cycle) qs.set("cycle", String(cycle));
+        if (scopeSel.startsWith("y:")) qs.set("cycle", scopeSel.slice(2));
+        else if (scopeSel.startsWith("r:")) {
+          const bar = scopeSel.indexOf("|");
+          qs.set("cycle", scopeSel.slice(2, bar));
+          qs.set("report", scopeSel.slice(bar + 1));
+        }
         const res = await fetch(`/api/flows/rows?${qs}`);
         const data = await res.json().catch(() => null);
         if (!live) return;
@@ -3151,7 +3018,7 @@ function FlowGraph({ committeeId = "", donorKey = "", name = "", cycle = "", bar
       } catch (e) { if (live) setSelRows({ error: e.message }); }
     })();
     return () => { live = false; };
-  }, [sel, allCycles, cycle]);
+  }, [sel, scopeSel]);
 
   const recenter = (n) => {
     if (n.center) return;
@@ -3231,7 +3098,7 @@ function FlowGraph({ committeeId = "", donorKey = "", name = "", cycle = "", bar
         <span className="fec-ai-label" style={{ marginBottom: 0 }}>Money flows</span>
         <span className="fec-tag">
           {center.name || center.committeeId || center.donorKey.split("|")[0]}
-          {data ? ` · ${data.cycle === "all" ? "all stored cycles" : `cycle ${data.cycle}`}` : ""}
+          {` · ${scopeSel === "all" ? "all years" : scopeSel.startsWith("y:") ? scopeSel.slice(2) : scopeSel.slice(2).replace("|", " · ")}`}
         </span>
         {trail.length > 0 && (
           <button className="fec-btn ghost sm"
@@ -3239,12 +3106,42 @@ function FlowGraph({ committeeId = "", donorKey = "", name = "", cycle = "", bar
             ◂ Back
           </button>
         )}
-        {cycle ? (
-          <label className="fec-check" style={{ fontSize: 11 }}>
-            <input type="checkbox" checked={allCycles} onChange={(e) => setAllCycles(e.target.checked)} />
-            All cycles
-          </label>
-        ) : null}
+        {(() => {
+          // year/report scope picker — years from the response (collected pre-filter, so the
+          // list stays complete while filtered); TN entities also list each filed report.
+          const selYear = scopeSel.startsWith("y:") ? scopeSel.slice(2)
+            : scopeSel.startsWith("r:") ? scopeSel.slice(2, scopeSel.indexOf("|")) : "";
+          const years = [...new Set([...(data?.years || []), ...(selYear ? [selYear] : [])])].sort().reverse();
+          if (!years.length) return null;
+          return (
+            <label className="fec-check" style={{ fontSize: 11, gap: 4 }}
+              title="Scope the graph and its itemized tables to one year/cycle — or, for TN entities, one filed report">
+              scope
+              <select value={scopeSel} onChange={(e) => setScopeSel(e.target.value)}
+                style={{ background: "var(--ink)", color: "var(--bone)", border: "1px solid var(--line)", font: "inherit", maxWidth: 230 }}>
+                <option value="all">All years</option>
+                {years.map((y) => {
+                  const reps = (data?.reports || []).filter((rp) => rp.year === y);
+                  return reps.length ? (
+                    <optgroup key={y} label={y}>
+                      <option value={`y:${y}`}>{y} — all reports</option>
+                      {reps.map((rp) => (
+                        <option key={`${y}|${rp.report}`} value={`r:${y}|${rp.report}`}>{y} · {rp.report}</option>
+                      ))}
+                    </optgroup>
+                  ) : (
+                    <option key={y} value={`y:${y}`}>{y}</option>
+                  );
+                })}
+              </select>
+            </label>
+          );
+        })()}
+        <label className="fec-check" style={{ fontSize: 11 }}
+          title="Hide vendors, payees and non-candidate committees — just who funds candidates">
+          <input type="checkbox" checked={candOnly} onChange={(e) => setCandOnly(e.target.checked)} />
+          Candidates only
+        </label>
         {center.committeeId && /^C\d{4,}$/i.test(center.committeeId) && (
           <button className="fec-btn ghost sm" onClick={() => load(center, { trace: true })} disabled={tracing || st.loading}
             title="Pull this committee's top-100 receipts and disbursements from the FEC into the ledger, then redraw">
@@ -3359,7 +3256,7 @@ function FlowGraph({ committeeId = "", donorKey = "", name = "", cycle = "", bar
               {selRows?.error && <div className="fec-error" role="alert" style={{ marginTop: 8 }}>{selRows.error}</div>}
               {selRows?.data && (selRows.data.rows.length === 0 ? (
                 <div className="fec-empty" style={{ marginTop: 8 }}>
-                  No itemized rows stored for this selection{cycle && !allCycles ? " in this cycle — try All cycles" : ""}.
+                  No itemized rows stored for this selection{scopeSel !== "all" ? " in this scope — try All years" : ""}.
                 </div>
               ) : (
                 <div className="fec-table-wrap" style={{ marginTop: 8 }}>
@@ -3413,27 +3310,34 @@ function PatternsPanel({ committeeId, candidateId, name, cycle, raceState }) {
   const TABS = [["timing", "Timing"], ["movement", "Movement"], ["geo", "Geography"],
     ["sectors", "Sectors"], ["households", "Households"], ["outside", "Outside $"]];
 
-  // shared composition fetch (geo / sectors / households ride the same row pull)
+  // shared composition fetch (geo / sectors / households ride the same row pull).
+  // IMPORTANT: `comp` must NOT be an effect dependency with a cancel-guard — setComp({loading})
+  // re-ran the effect, whose cleanup flipped the guard and discarded the arriving response,
+  // leaving the spinner stuck forever (caught live on Harshbarger TN-01). compRef tracks
+  // in-flight/done state without re-triggering the effect.
   const [comp, setComp] = useState(null); // null | {loading} | {data} | {error}
+  const compRef = useRef(null);
+  const [compNonce, setCompNonce] = useState(0); // bump to force a refetch after an error
   const needComp = tab === "geo" || tab === "sectors" || tab === "households";
   useEffect(() => {
-    if (!needComp || comp) return;
-    let live = true;
+    if (!needComp || compRef.current) return; // already fetched (or in flight) for this mount
+    compRef.current = { loading: true };
+    setComp(compRef.current);
     (async () => {
-      setComp({ loading: true });
       try {
         const qs = new URLSearchParams({ committeeId });
         if (cycle) qs.set("cycle", String(cycle));
         if (raceState) qs.set("homeState", raceState);
         const res = await fetch(`/api/patterns/composition?${qs}`);
         const data = await res.json().catch(() => null);
-        if (!live) return;
         if (!res.ok) throw new Error(data?.error?.message || `Composition failed (HTTP ${res.status})`);
-        setComp({ data });
-      } catch (e) { if (live) setComp({ error: e.message }); }
+        compRef.current = { data };
+      } catch (e) {
+        compRef.current = { error: e.message, retryable: true };
+      }
+      setComp(compRef.current);
     })();
-    return () => { live = false; };
-  }, [needComp, comp, committeeId, cycle, raceState]);
+  }, [needComp, committeeId, cycle, raceState, compNonce]);
 
   return (
     <div className="fec-ledger" style={{ marginTop: 10 }}>
@@ -3451,7 +3355,12 @@ function PatternsPanel({ committeeId, candidateId, name, cycle, raceState }) {
         {tab === "timing" && <TimingSection committeeId={committeeId} cycle={cycle} usd={usd} />}
         {tab === "movement" && <MovementSection committeeId={committeeId} cycle={cycle} usd={usd} />}
         {needComp && comp?.loading && <div className="fec-spin">Analyzing the donor base…</div>}
-        {needComp && comp?.error && <div className="fec-error" role="alert">{comp.error}</div>}
+        {needComp && comp?.error && (
+          <div className="fec-error" role="alert">
+            {comp.error}{" "}
+            <button className="fec-btn ghost sm" onClick={() => { compRef.current = null; setCompNonce((n) => n + 1); }}>↺ Retry</button>
+          </div>
+        )}
         {tab === "geo" && comp?.data && <GeoSection data={comp.data} usd={usd} />}
         {tab === "sectors" && comp?.data && <SectorSection data={comp.data} usd={usd} />}
         {tab === "households" && comp?.data && <HouseholdSection data={comp.data} usd={usd} />}
@@ -3731,25 +3640,67 @@ function GeoSection({ data, usd }) {
   );
 }
 
-// Industry-sector rollup of the donor base (/api/patterns/composition).
+// Industry-sector rollup of the donor base (/api/patterns/composition), with a per-sector
+// "Donors ▸" drill-through — top donors ride along in the composition payload, so expanding
+// a sector costs zero extra requests.
 function SectorSection({ data, usd }) {
+  const [openSector, setOpenSector] = useState(null);
   return (
     <div>
       {data.note && <div className="fec-tag" style={{ marginBottom: 6 }}>ⓘ {data.note}</div>}
       <div className="fec-table-wrap">
         <table className="fec-table">
-          <thead><tr><th>Sector</th><th>Donors</th><th>Gifts</th><th className="amt">Total</th><th className="amt">%</th><th>Top employers</th></tr></thead>
+          <thead><tr><th>Sector</th><th>Donors</th><th>Gifts</th><th className="amt">Total</th><th className="amt">%</th><th>Top employers</th><th aria-label="Actions" /></tr></thead>
           <tbody>
-            {(data.sectors || []).map((s) => (
-              <tr key={s.sector}>
-                <td><b style={{ color: "var(--bone)" }}>{s.sector}</b></td>
-                <td>{s.donors}</td>
-                <td className="sub">{s.gifts}</td>
-                <td className="amt">{usd(s.total)}</td>
-                <td className="amt">{s.pct}%</td>
-                <td className="sub">{(s.topEmployers || []).map((e) => `${e.employer} (${fmtUSDshort(e.total)})`).join(" · ") || "—"}</td>
-              </tr>
-            ))}
+            {(data.sectors || []).map((s) => {
+              const open = openSector === s.sector;
+              return (
+                <Fragment key={s.sector}>
+                  <tr>
+                    <td><b style={{ color: "var(--bone)" }}>{s.sector}</b></td>
+                    <td>{s.donors}</td>
+                    <td className="sub">{s.gifts}</td>
+                    <td className="amt">{usd(s.total)}</td>
+                    <td className="amt">{s.pct}%</td>
+                    <td className="sub">{(s.topEmployers || []).map((e) => `${e.employer} (${fmtUSDshort(e.total)})`).join(" · ") || "—"}</td>
+                    <td style={{ textAlign: "right" }}>
+                      <button className="fec-btn ghost sm" aria-expanded={open}
+                        onClick={() => setOpenSector(open ? null : s.sector)}
+                        disabled={!(s.topDonors || []).length}
+                        title="Top donors classified under this sector">
+                        {open ? "Close ▾" : "Donors ▸"}
+                      </button>
+                    </td>
+                  </tr>
+                  {open && (
+                    <tr>
+                      <td colSpan={7} style={{ padding: "4px 8px 10px", borderTop: "none" }}>
+                        <table className="fec-table">
+                          <thead><tr><th>Donor</th><th>Employer / Occupation</th><th>Location</th><th>Gifts</th><th className="amt">Total</th><th className="amt">% of sector</th></tr></thead>
+                          <tbody>
+                            {(s.topDonors || []).map((d) => (
+                              <tr key={d.donorKey}>
+                                <td><b style={{ color: "var(--bone)" }}>{d.name || d.donorKey.split("|")[0]}</b></td>
+                                <td className="sub">{[d.employer, d.occupation].filter(Boolean).join(" · ") || "—"}</td>
+                                <td className="sub">{[d.city, d.state].filter(Boolean).join(", ") || "—"}</td>
+                                <td>{d.count}</td>
+                                <td className="amt">{usd(d.total)}</td>
+                                <td className="amt">{s.total ? `${((d.total / s.total) * 100).toFixed(1)}%` : "—"}</td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                        {(s.donors || 0) > (s.topDonors || []).length && (
+                          <div className="sub" style={{ paddingTop: 4 }}>
+                            Top {(s.topDonors || []).length} of {s.donors} donors in this sector — search any name in the Donors tab for their full history.
+                          </div>
+                        )}
+                      </td>
+                    </tr>
+                  )}
+                </Fragment>
+              );
+            })}
           </tbody>
         </table>
       </div>
@@ -3949,7 +3900,7 @@ function SimilarDonors({ donorKey, name, onSearch }) {
   );
 }
 
-function DonorsPanel({ onDrillTn }) {
+function DonorsPanel({ onDrillTn, seed }) {
   // watchlist
   const [watch, setWatch] = useState({ loading: true, donors: [] });
   const [stats, setStats] = useState(null); // {rows, donors, recipients}
@@ -4119,6 +4070,15 @@ function DonorsPanel({ onDrillTn }) {
     } catch (e) { setSearchErr(e.message); setSearchRes(null); }
     finally { setSearching(false); }
   };
+
+  // Money Race "Donor ▸" drill-through: seed arrives with a fresh timestamp → run a name search
+  useEffect(() => {
+    if (!seed?.name) return;
+    setQMode("name");
+    setQName(seed.name);
+    runSearch(false, seed.name);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [seed?.t]);
 
   // Reverse lookup: everyone whose employer/occupation contains the query, grouped by
   // recipient (who the money reaches) and by donor. Backed by /api/donors/byfield.
@@ -4337,6 +4297,7 @@ function DonorsPanel({ onDrillTn }) {
               {Number(stats.rows || 0).toLocaleString()} stored rows · {Number(stats.donors || 0).toLocaleString()} donors · {Number(stats.recipients || 0).toLocaleString()} recipients
             </span>
           )}
+          {/* bulk-data status consolidated into ⚙ Admin (Connections & FEC bulk data sections) */}
           <span style={{ marginLeft: "auto" }}>
             <button className="fec-btn ghost sm" onClick={runWatchRefresh}
               disabled={refreshRes?.loading || !(watch.donors || []).length}
@@ -4583,6 +4544,12 @@ function DonorsPanel({ onDrillTn }) {
         return (
           <>
             <div className="fec-status">
+              <button className="fec-btn ghost sm" style={{ marginRight: 8 }}
+                title="Standing search — the 🔔 alert scan flags new gifts matching this query"
+                onClick={async () => {
+                  await fetch("/api/searches", { method: "POST", headers: { "content-type": "application/json" },
+                    body: JSON.stringify({ q: fieldRes.q, field: fieldRes.field }) }).catch(() => {});
+                }}>★ Save search</button>
               <span>
                 “{fieldRes.q}” ({label}) — {Number(t.donors || 0).toLocaleString()} donor{t.donors === 1 ? "" : "s"} ·{" "}
                 {Number(t.count || 0).toLocaleString()} gifts · {fmtUSDshort(t.total || 0)} → {Number(t.recipients || 0).toLocaleString()} recipient{t.recipients === 1 ? "" : "s"}
@@ -4693,6 +4660,18 @@ function TnPanel({ seed }) {
   const [office, setOffice] = useState("");
   const [year, setYear] = useState("");
   const [type, setType] = useState("both");
+  const [district, setDistrict] = useState(""); // TREF district id (depends on office)
+  const [party, setParty] = useState("");       // TREF party id
+  const [winner, setWinner] = useState("");     // "" | primary | general
+  const [districtOpts, setDistrictOpts] = useState([]);
+  useEffect(() => {
+    let live = true;
+    setDistrict(""); setDistrictOpts([]);
+    if (!office) return undefined;
+    fetch(`/api/tn/districts?office=${encodeURIComponent(office)}`).then((r) => r.json())
+      .then((d) => { if (live) setDistrictOpts(d?.districts || []); }).catch(() => {});
+    return () => { live = false; };
+  }, [office]);
   const [result, setResult] = useState(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
@@ -4721,6 +4700,48 @@ function TnPanel({ seed }) {
   const [donorGiftFilter, setDonorGiftFilter] = useState(""); // partial-string filter on recipient/name
   // previous searches (paginated history)
   const [history, setHistory] = useState({ rows: [], total: 0 });
+
+  // ---- tracked TN entities (mirrors the Donors tab watchlist) ----
+  const [tnWatch, setTnWatch] = useState({ loading: true, entities: [] });
+  const [twOverride, setTwOverride] = useState({}); // tnId -> bool, optimistic until list reloads
+  const loadTnWatch = async () => {
+    try {
+      const res = await fetch("/api/tn/watchlist");
+      const data = await res.json().catch(() => null);
+      if (!res.ok) throw new Error(data?.error?.message || `Watchlist failed (HTTP ${res.status})`);
+      setTnWatch({ entities: data?.entities || [] });
+      setTwOverride({});
+    } catch (e) { setTnWatch((w) => ({ entities: w.entities || [], error: e.message })); }
+  };
+  useEffect(() => { loadTnWatch(); }, []);
+  const tnWatchedIds = new Set((tnWatch.entities || []).map((w) => String(w.tnId)));
+  const isTnWatched = (tnId) => (twOverride[tnId] != null ? twOverride[tnId] : tnWatchedIds.has(String(tnId)));
+  const trackTn = async (r, office, party) => {
+    const tnId = String(r.tnId);
+    try {
+      const res = await fetch("/api/tn/watch", {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ tnId, name: entityName(r), office: office || "", party: party || "" }),
+      });
+      if (!res.ok) throw new Error(`Track failed (HTTP ${res.status})`);
+      setTwOverride((p) => ({ ...p, [tnId]: true }));
+      loadTnWatch();
+    } catch (e) { setError(e.message); }
+  };
+  const untrackTn = async (tnId) => {
+    try {
+      await fetch(`/api/tn/watch?id=${encodeURIComponent(tnId)}`, { method: "DELETE" });
+      setTwOverride((p) => ({ ...p, [tnId]: false }));
+      loadTnWatch();
+    } catch { /* list reload corrects */ }
+  };
+  // Open ▸ = run the TN search for this entity (marks its new-row badge as seen)
+  const openTracked = (w) => {
+    setName(w.name);
+    search(false, w.name);
+    fetch("/api/tn/watch/seen", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ tnId: w.tnId }) })
+      .then(() => loadTnWatch()).catch(() => { /* badge clears next reload */ });
+  };
   const [histPage, setHistPage] = useState(0);
   const [histExpanded, setHistExpanded] = useState({}); // id -> {loading, data, error}
   const HIST_PER = 10;
@@ -4733,9 +4754,13 @@ function TnPanel({ seed }) {
   useEffect(() => {
     if (!result?.rows?.length) return;
     const tnIds = [...new Set(result.rows.map((r) => r.tnId).filter(Boolean))];
+    // Small result sets fetch each entity's report list live. Bigger ones only read what is already
+    // stored (live=0) — otherwise a 40-row result fired 40 report-list scrapes at apps.tn.gov in the
+    // background just to fill the "last filed" column. Opening an entity still fetches it live.
+    const liveParam = tnIds.length > 6 ? "&live=0" : "";
     for (const id of tnIds) {
       setLastFiled((p) => { if (p[id]) return p; return { ...p, [id]: { loading: true } }; });
-      fetch(`/api/tn/reports?id=${id}`)
+      fetch(`/api/tn/reports?id=${id}${liveParam}`)
         .then((r) => r.json())
         .then((data) => {
           const rows = data.rows || data.reports || [];
@@ -4770,11 +4795,14 @@ function TnPanel({ seed }) {
 
   const search = async (forceRefresh = false, overrideName) => {
     const nm = typeof overrideName === "string" ? overrideName : name; // drill-through passes the clicked name before state settles
-    if (!nm && !office && !year) { setError("Provide at least a name, office, or election year."); return; }
+    if (!nm && !office && !year && !party) { setError("Provide at least a name, office, party, or election year."); return; }
     setLoading(true); setError(null); setReports({}); setAiProfiles({}); setMoney({}); setMoneyTab({}); setTrends({}); setLastFiled({}); setLocalFilter("");
     setActivity({}); setLedger({}); setLedgerYear({}); setRecvView({}); setSpentView({}); setFlowsOpen({}); // index-keyed per-row state — stale across result sets
     try {
       const qs = new URLSearchParams({ name: nm, office, year, type });
+      if (district) qs.set("district", district);
+      if (party) qs.set("party", party);
+      if (winner) qs.set("winner", winner);
       if (forceRefresh) qs.set("_refresh", "1");
       const res = await fetch(`/api/tn/candidates?${qs}`);
       const data = await res.json().catch(() => null);
@@ -5655,6 +5683,54 @@ function TnPanel({ seed }) {
 
   return (
     <>
+      {/* ── Tracked TN entities (mirrors the Donors tab watchlist) ── */}
+      <section className="fec-controls" style={{ marginTop: 18, display: "block", borderTopColor: "var(--olive)" }} aria-label="Tracked TN entities">
+        <div style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
+          <span className="fec-ai-label" style={{ marginBottom: 0 }}>Tracked TN entities</span>
+          {(tnWatch.entities || []).length > 0 && (
+            <span className="fec-tag">{tnWatch.entities.length} tracked · ★ Track any search result below</span>
+          )}
+        </div>
+        {tnWatch.error && <div className="fec-error" role="alert" style={{ marginTop: 10 }}>{tnWatch.error}</div>}
+        {tnWatch.loading ? (
+          <div className="fec-spin" style={{ marginTop: 10 }}>Loading tracked entities…</div>
+        ) : (tnWatch.entities || []).length > 0 ? (
+          <div className="fec-table-wrap" style={{ marginTop: 10 }}>
+            <table className="fec-table">
+              <thead>
+                <tr><th>Entity</th><th>Office / Party</th><th className="amt">Stored received</th><th className="amt">Stored spent</th><th>New rows</th><th aria-label="Actions" /></tr>
+              </thead>
+              <tbody>
+                {tnWatch.entities.map((w) => (
+                  <tr key={w.tnId}>
+                    <td>
+                      <b style={{ color: "var(--bone)" }}>{w.name}</b>
+                      <div className="sub">added {timeAgo(w.addedAt)}</div>
+                    </td>
+                    <td className="sub">{[w.office, w.party].filter(Boolean).join(" · ") || "—"}</td>
+                    <td className="amt">{fmtUSDshort(w.received || 0)}</td>
+                    <td className="amt">{fmtUSDshort(w.spent || 0)}</td>
+                    <td>
+                      {w.newCount > 0
+                        ? <span style={{ color: "var(--brass)", fontWeight: 700 }} title="Itemized rows stored since you last opened this entity">▲ {w.newCount} new</span>
+                        : <span className="sub">—</span>}
+                    </td>
+                    <td style={{ whiteSpace: "nowrap", textAlign: "right" }}>
+                      <button className="fec-btn ghost sm" onClick={() => openTracked(w)}
+                        title="Search this entity below (marks new rows as seen)">Open ▸</button>
+                      {" "}
+                      <button className="fec-btn ghost sm" onClick={() => untrackTn(w.tnId)} title="Stop tracking">✕</button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        ) : !tnWatch.error && (
+          <div className="sub" style={{ marginTop: 8 }}>No tracked TN entities yet — search below and hit ★ Track on any result.</div>
+        )}
+      </section>
+
       <section className="fec-controls" style={{ marginTop: 18, borderTopColor: "var(--olive)" }} aria-label="TN search">
         {/* Mode toggle */}
         <div style={{ gridColumn: "1 / -1", display: "flex", gap: 6, marginBottom: 2 }}>
@@ -5676,10 +5752,10 @@ function TnPanel({ seed }) {
               <label htmlFor="tn-name">Candidate / PAC name</label>
               <input id="tn-name" value={name} onChange={(e) => setName(e.target.value)}
                 onKeyDown={(e) => e.key === "Enter" && search()}
-                placeholder="Partial name OK — e.g. yager, smith, tenn medical"
+                placeholder="Any part of the name — e.g. yager, health, realtors"
                 style={{ width: "100%", background: "var(--ink)", color: "var(--bone)", border: "1px solid var(--line)", padding: "8px 10px", font: "inherit" }} />
               <span className="sub" style={{ marginTop: 4, display: "block" }}>
-                ⓘ For a <b>candidate</b>, search by <b>last name</b> (TREF indexes candidates by last name — e.g. "Yager", not "Ken Yager"). PACs search by their name.
+Matches any part of the name. For a <b>candidate</b>, use the <b>last name</b> (TREF indexes candidates by last name — "Yager", not "Ken Yager").
               </span>
             </div>
             <div className="fec-field">
@@ -5702,12 +5778,33 @@ function TnPanel({ seed }) {
               <select id="tn-year" value={year} onChange={(e) => setYear(e.target.value)}>
                 <option value="">Any year</option>
                 {(meta?.years || []).map((y) => <option key={y.id} value={y.id}>{y.label}</option>)}
-                <option disabled>── year list synced Jun 2026 ──</option>
+              </select>
+            </div>
+            <div className="fec-field">
+              <label htmlFor="tn-district">District</label>
+              <select id="tn-district" value={district} onChange={(e) => setDistrict(e.target.value)} disabled={!districtOpts.length}>
+                <option value="">{office ? (districtOpts.length ? "Any district" : "No districts") : "Pick an office first"}</option>
+                {districtOpts.map((d) => <option key={d.id} value={d.id}>{d.label}</option>)}
+              </select>
+            </div>
+            <div className="fec-field">
+              <label htmlFor="tn-party">Party</label>
+              <select id="tn-party" value={party} onChange={(e) => setParty(e.target.value)}>
+                <option value="">Any party</option>
+                {(meta?.parties || []).map((pt) => <option key={pt.id} value={pt.id}>{pt.label}</option>)}
+              </select>
+            </div>
+            <div className="fec-field">
+              <label htmlFor="tn-winner">Election result</label>
+              <select id="tn-winner" value={winner} onChange={(e) => setWinner(e.target.value)}>
+                <option value="">Any</option>
+                <option value="primary">Won the primary</option>
+                <option value="general">Won the general</option>
               </select>
             </div>
             <div className="fec-actions">
-              <button className="fec-btn" onClick={() => search(false)} disabled={loading}>{loading ? "Querying (trying name variants)…" : "Pull records"}</button>
-              <span className="fec-hint">TN Registry of Election Finance · TREF searches by name prefix; auto-tries "Tennessee…", "TN…", "Tennesseans for…" (~15s first search). After results load, use the filter box to narrow further. · <b>Election year list last synced Jun 2026</b> — if a new race isn't showing, update year IDs in <code>server/tn.js</code> (view-source on TREF, search "electionYearSelection").</span>
+              <button className="fec-btn" onClick={() => search(false)} disabled={loading}>{loading ? "Querying TREF…" : "Pull records"}</button>
+              <span className="fec-hint">Tennessee Registry of Election Finance. One wildcard search matches any part of the name; results are saved for a day. Election years, offices and districts are read from the live TREF form.</span>
             </div>
           </>
         ) : (
@@ -5764,7 +5861,7 @@ function TnPanel({ seed }) {
               (() => {
                 const H = donorResult.headers || [];
                 const ci = (re) => H.findIndex((h) => re.test(h));
-                const amtI = ci(/amount/i), dateI = ci(/date/i), recI = ci(/recipient.*name|candidate.*pac/i), repI = ci(/report.*name/i), typeI = ci(/^type$/i);
+                const amtI = ci(/amount/i), dateI = ci(/date/i), recI = ci(/recipient.*name|candidate.*pac/i), repI = ci(/report.*name/i), typeI = ci(/^type$/i), conI = ci(/contributor.*name/i);
                 const sortKey = (d) => { const m = String(d || "").match(/(\d{1,2})\/(\d{1,2})\/(\d{4})/); return m ? `${m[3]}${m[1].padStart(2, "0")}${m[2].padStart(2, "0")}` : "0"; };
                 const yearOf = (d) => (String(d || "").match(/\b(\d{4})\b/) || [])[1] || "—";
                 const gifts = (donorResult.rows || []).map((r) => ({
@@ -5772,18 +5869,56 @@ function TnPanel({ seed }) {
                   recipient: recI >= 0 ? (r[recI] || "").trim() : "",
                   amount: amtI >= 0 ? Number(String(r[amtI] || "").replace(/[^0-9.-]/g, "")) || 0 : 0,
                   report: repI >= 0 ? r[repI] : "", type: typeI >= 0 ? r[typeI] : "",
+                  who: conI >= 0 ? (r[conI] || "").trim() : "",
                 })).map((g) => ({ ...g, ptype: classifyPayee(g.recipient) }))
                   .sort((a, b) => sortKey(b.date).localeCompare(sortKey(a.date)));
+                // TREF's contributor index is a SURNAME search — group by contributor so three
+                // Parliers don't read as one donor (caught live: Brian/Lisa/Steve blended).
+                const peopleM = new Map();
+                for (const g of gifts) {
+                  const k = (g.who || "?").toUpperCase();
+                  const p = peopleM.get(k) || { name: g.who || "?", total: 0, count: 0, years: new Set() };
+                  p.total += g.amount; p.count++; p.years.add(g.year);
+                  peopleM.set(k, p);
+                }
+                const people = [...peopleM.values()].sort((a, b) => b.total - a.total);
+                const multi = people.length > 1;
                 const byYr = {};
                 for (const g of gifts) { (byYr[g.year] = byYr[g.year] || { year: g.year, total: 0, count: 0 }); byYr[g.year].total += g.amount; byYr[g.year].count++; }
                 const years = Object.values(byYr).sort((a, b) => b.year.localeCompare(a.year));
                 const q = donorGiftFilter.trim().toLowerCase();
                 const shown = gifts.filter((g) =>
                   (donorGiftYear === "all" || g.year === donorGiftYear) &&
-                  (!q || g.recipient.toLowerCase().includes(q) || (g.ptype || "").toLowerCase().includes(q)));
+                  (!q || g.recipient.toLowerCase().includes(q) || (g.ptype || "").toLowerCase().includes(q) || (g.who || "").toLowerCase().includes(q)));
                 const shownTotal = shown.reduce((a, g) => a + g.amount, 0);
                 return (
                   <>
+                    {multi && (
+                      <div style={{ marginTop: 10 }}>
+                        <div className="fec-ai-label">
+                          ⚠ Surname search — {people.length} distinct contributors matched · click one to filter to just their gifts
+                        </div>
+                        <div className="fec-table-wrap" style={{ marginTop: 4 }}>
+                          <table className="fec-table">
+                            <thead><tr><th>Contributor</th><th>Gifts</th><th>Years</th><th className="amt">Their total</th></tr></thead>
+                            <tbody>
+                              {people.map((p) => (
+                                <tr key={p.name} style={{ cursor: "pointer" }}
+                                  onClick={() => setDonorGiftFilter(donorGiftFilter === p.name ? "" : p.name)}>
+                                  <td><b style={{ color: donorGiftFilter === p.name ? "var(--brass)" : "var(--bone)" }}>{p.name}</b></td>
+                                  <td>{p.count}</td>
+                                  <td className="sub">{[...p.years].sort().join(", ")}</td>
+                                  <td className="amt">{fmtUSDshort(p.total)}</td>
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        </div>
+                        <div className="sub" style={{ marginTop: 4 }}>
+                          The totals above the ledger combine ALL matched contributors — they are different people, not one donor.
+                        </div>
+                      </div>
+                    )}
                     {years.length > 0 && (
                       <div style={{ marginTop: 10 }}>
                         <div className="fec-ai-label">By year · click to filter</div>
@@ -5822,11 +5957,12 @@ function TnPanel({ seed }) {
                       </div>
                       <div className="fec-table-wrap" style={{ maxHeight: 360, overflowY: "auto", marginTop: 6 }}>
                         <table className="fec-table">
-                          <thead><tr><th>Year</th><th>Date</th><th>Recipient</th><th>Type</th><th className="amt">Amount</th><th>Filing</th></tr></thead>
+                          <thead><tr><th>Year</th>{multi && <th>Contributor</th>}<th>Date</th><th>Recipient</th><th>Type</th><th className="amt">Amount</th><th>Filing</th></tr></thead>
                           <tbody>
                             {shown.slice(0, 400).map((g, k) => (
                               <tr key={k}>
                                 <td><b style={{ color: "var(--bone)" }}>{g.year}</b></td>
+                                {multi && <td>{g.who || "—"}</td>}
                                 <td className="sub">{g.date || "—"}</td>
                                 <td>{g.recipient
                                   ? <button className="fec-row-btn" style={{ textAlign: "left", fontWeight: "inherit" }} onClick={() => { setName(g.recipient); setDonorMode(false); }}>{g.recipient}</button>
@@ -5844,8 +5980,8 @@ function TnPanel({ seed }) {
                       <div style={{ marginTop: 8 }}>
                         <button className="fec-btn ghost sm"
                           onClick={() => downloadCSV(`tn_donor_${donorName.replace(/\s+/g, "_")}.csv`,
-                            ["Year", "Date", "Recipient", "Type", "Amount", "Filing"],
-                            shown.map((g) => [g.year, g.date, g.recipient, g.ptype, g.amount, g.report]))}>
+                            ["Year", "Contributor", "Date", "Recipient", "Type", "Amount", "Filing"],
+                            shown.map((g) => [g.year, g.who, g.date, g.recipient, g.ptype, g.amount, g.report]))}>
                           Export CSV ({shown.length})
                         </button>
                       </div>
@@ -6009,6 +6145,13 @@ function TnPanel({ seed }) {
                                 title="Money-flow graph — who funds this entity, where its money goes, and where its donors also give (click any node or edge to itemize)">
                                 {flowsOpen[r.tnId] ? "Close ▾" : "Flows ▸"}
                               </button>
+                            )}
+                            {r.tnId && (
+                              isTnWatched(String(r.tnId))
+                                ? <button className="fec-btn ghost sm" onClick={() => untrackTn(String(r.tnId))}
+                                    title="Stop tracking this entity">★ Untrack</button>
+                                : <button className="fec-btn ghost sm" onClick={() => trackTn(r, office, party)}
+                                    title="Add to the Tracked TN entities list at the top of this tab">☆ Track</button>
                             )}
                             <DossierButton sm endpoint="/api/tn/dossier" payload={{ tnId: r.tnId || "", name: entityName(r) }} />
                           </div>
@@ -6416,6 +6559,377 @@ function TnPanel({ seed }) {
 }
 
 // ---------- admin panel ----------
+// ---- alerts panel (filings · attack ads · PAC spreading · standing searches) ----
+const ALERT_ICON = { filing: "📄", ie: "📣", pac: "🕸", search: "⌕" };
+function AlertsPanel({ onClose, onCount }) {
+  const [st, setSt] = useState(null);
+  const [scanning, setScanning] = useState(false);
+  const load = async () => {
+    try { const d = await fetch("/api/alerts").then((r) => r.json()); setSt(d); onCount?.(d.unseen || 0); }
+    catch { /* panel shows nothing */ }
+  };
+  useEffect(() => { load(); }, []);
+  const scan = async () => {
+    setScanning(true);
+    try { await fetch("/api/alerts/scan", { method: "POST" }); await load(); }
+    finally { setScanning(false); }
+  };
+  const markRead = async () => { await fetch("/api/alerts/seen", { method: "POST" }).catch(() => {}); load(); };
+  return (
+    <div className="fec-ledger" style={{ marginTop: 12 }}>
+      <div className="fec-ledger-head">
+        <span className="fec-name">🔔 Alerts</span>
+        <span className="fec-tag">{st?.lastScanAt ? `last scan ${timeAgo(st.lastScanAt)}` : "never scanned"} · scans also run after scheduled bulk imports</span>
+        <button className="fec-btn ghost sm" onClick={scan} disabled={scanning}>{scanning ? "Scanning…" : "↺ Scan now"}</button>
+        <button className="fec-btn ghost sm" onClick={markRead} disabled={!st?.unseen}>Mark all read</button>
+        <button className="close" onClick={onClose}>Close ✕</button>
+      </div>
+      {(st?.searches || []).length > 0 && (
+        <div className="fec-ledger-bar" style={{ flexWrap: "wrap", gap: 6 }}>
+          {st.searches.map((s) => (
+            <span key={s.id} className="fec-tag">
+              ⌕ {s.q} ({s.field}){" "}
+              <button className="fec-btn ghost sm" style={{ padding: "0 6px" }} title="Remove standing search"
+                onClick={async () => { await fetch(`/api/searches?id=${encodeURIComponent(s.id)}`, { method: "DELETE" }); load(); }}>✕</button>
+            </span>
+          ))}
+        </div>
+      )}
+      <div style={{ padding: "8px 16px 14px" }}>
+        {!st && <div className="fec-spin">Loading…</div>}
+        {st && !(st.feed || []).length && <div className="fec-empty" style={{ marginTop: 8 }}>No alerts yet — track candidates/donors, save a search, then hit ↺ Scan now.</div>}
+        {(st?.feed || []).map((a) => (
+          <div key={a.id || a.ref} style={{ display: "flex", gap: 10, padding: "6px 0", borderBottom: "1px solid var(--line)", fontSize: 12, alignItems: "baseline" }}>
+            <span title={a.kind}>{ALERT_ICON[a.kind] || "•"}</span>
+            <b style={{ color: "var(--bone)", whiteSpace: "nowrap" }}>{a.subject}</b>
+            <span className={a.kind === "ie" && /AGAINST/.test(a.detail || "") ? "" : "sub"}
+              style={a.kind === "ie" && /AGAINST/.test(a.detail || "") ? { color: "var(--rose)" } : {}}>{a.detail}</span>
+            <span className="sub" style={{ marginLeft: "auto", whiteSpace: "nowrap" }}>{timeAgo(a.at)}</span>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// ---- receipts sparkline (filing-period history from candidate_totals) ----
+function Spark({ points, title = "Receipts by filing period" }) {
+  const vals = (points || []).map((p) => Number(p.receipts) || 0).filter((v) => v > 0);
+  if (vals.length < 2) return null; // history accrues as totals get pulled — render only when there's a trend
+  const max = Math.max(...vals, 1);
+  const w = 64, h = 18, step = w / (vals.length - 1);
+  const d = vals.map((v, i) => `${i ? "L" : "M"} ${(i * step).toFixed(1)} ${(h - 2 - (v / max) * (h - 4)).toFixed(1)}`).join(" ");
+  return (
+    <svg width={w} height={h} style={{ opacity: 0.9, flexShrink: 0 }} role="img" aria-label={title}>
+      <title>{`${title} — ${vals.length} filings, latest ${fmtUSDshort(vals[vals.length - 1])}`}</title>
+      <path d={d} fill="none" stroke="var(--brass)" strokeWidth="1.5" />
+    </svg>
+  );
+}
+
+// ---- nationwide quick-find (stored masters + ledger, zero FEC calls) ----
+function QuickFind({ onRace, onDonorsTab }) {
+  const [q, setQ] = useState("");
+  const [res, setRes] = useState(null);
+  const [open, setOpen] = useState(false);
+  const [flow, setFlow] = useState(null); // {committeeId, name} → inline FlowGraph
+  const seq = useRef(0), timer = useRef(null);
+  useEffect(() => () => clearTimeout(timer.current), []);
+  const onInput = (v) => {
+    setQ(v);
+    clearTimeout(timer.current);
+    if (v.trim().length < 2) { setOpen(false); setRes(null); return; }
+    const s = ++seq.current;
+    timer.current = setTimeout(async () => {
+      try {
+        const d = await fetch(`/api/find?q=${encodeURIComponent(v.trim())}`).then((r) => r.json());
+        if (s === seq.current) { setRes(d); setOpen(true); }
+      } catch { /* best-effort */ }
+    }, 250);
+  };
+  const any = (res?.candidates?.length || 0) + (res?.committees?.length || 0) + (res?.donors?.length || 0) > 0;
+  const row = { display: "flex", gap: 8, alignItems: "center", padding: "5px 10px", borderBottom: "1px solid var(--line)", fontSize: 12, flexWrap: "wrap" };
+  return (
+    <div style={{ marginTop: 14 }}>
+      <div style={{ position: "relative", maxWidth: 720 }}>
+        <input value={q} onChange={(e) => onInput(e.target.value)}
+          onKeyDown={(e) => e.key === "Escape" && setOpen(false)}
+          onBlur={() => setTimeout(() => setOpen(false), 200)}
+          onFocus={() => res && setOpen(true)}
+          placeholder="Find any candidate, committee or donor already stored"
+          style={{ width: "100%", background: "var(--panel)", color: "var(--bone)", border: "1px solid var(--line)", padding: "9px 12px", font: "inherit", fontSize: 14 }} />
+        {open && (
+          <div style={{ position: "absolute", top: "calc(100% + 4px)", left: 0, right: 0, zIndex: 40, background: "var(--panel)", border: "1px solid var(--line)", borderRadius: "var(--radius-sm)", boxShadow: "var(--shadow)", maxHeight: 340, overflowY: "auto" }}>
+            {!any && <div className="sub" style={{ padding: "8px 10px" }}>Nothing stored matches — masters fill in via browsing and the bulk import.</div>}
+            {(res?.candidates || []).map((c) => (
+              <div key={c.candId} style={row}>
+                <b style={{ color: "var(--bone)" }}>{c.name}</b>
+                <span className="sub">{[c.party, c.office === "H" ? `${c.state}-${c.district}` : c.office === "S" ? `${c.state} Senate` : c.office === "P" ? "President" : c.state].filter(Boolean).join(" · ")}{c.lastCycle ? ` · ${c.lastCycle}` : ""}</span>
+                <span style={{ marginLeft: "auto", display: "flex", gap: 6 }}>
+                  {c.office !== "P" && c.state && (
+                    <button className="fec-btn ghost sm" onMouseDown={() => { setOpen(false); onRace?.(c); }}
+                      title="Open this candidate's race in Money Race">Race ▸</button>
+                  )}
+                  {c.pcc && (
+                    <button className="fec-btn ghost sm" onMouseDown={() => { setOpen(false); setFlow({ committeeId: c.pcc, name: c.name }); }}>Flows ▸</button>
+                  )}
+                </span>
+              </div>
+            ))}
+            {(res?.committees || []).map((c) => (
+              <div key={c.cmteId} style={row}>
+                <span style={{ color: "var(--bone)" }}>{c.name}</span>
+                <span className="sub">{[c.type, c.party, c.state].filter(Boolean).join(" · ")} · committee</span>
+                <span style={{ marginLeft: "auto" }}>
+                  <button className="fec-btn ghost sm" onMouseDown={() => { setOpen(false); setFlow({ committeeId: c.cmteId, name: c.name }); }}>Flows ▸</button>
+                </span>
+              </div>
+            ))}
+            {(res?.donors || []).map((d) => (
+              <div key={d.donorKey} style={row}>
+                <span style={{ color: "var(--bone)" }}>{d.name}</span>
+                <span className="sub">{[d.employer, d.state].filter(Boolean).join(" · ")} · donor · {fmtUSDshort(d.total)} ({d.count})</span>
+                <span style={{ marginLeft: "auto" }}>
+                  <button className="fec-btn ghost sm" onMouseDown={() => { setOpen(false); onDonorsTab?.(d.name); }}
+                    title="Open the Donors tab">Donors ▸</button>
+                </span>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+      {flow && (
+        <div style={{ position: "relative" }}>
+          <button className="fec-btn ghost sm" onClick={() => setFlow(null)}
+            style={{ position: "absolute", right: 8, top: 18, zIndex: 5 }}>Close ✕</button>
+          <FlowGraph key={flow.committeeId} committeeId={flow.committeeId} name={flow.name} cycle="" />
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ---- Admin: consolidated connections + bulk-source freshness ----
+// Everything that used to live scattered (header text, tab tags) reports here. Bulk rows compare
+// the FEC's Last-Modified against the local zip — "new data available" is measured, not guessed.
+function ConnectionsSection() {
+  const [src, setSrc] = useState(null); // /api/admin/sources payload
+  const [loading, setLoading] = useState(true);
+  const load = async (fresh = false) => {
+    setLoading(true);
+    try {
+      const res = await fetch(`/api/admin/sources${fresh ? "?fresh=1" : ""}`);
+      setSrc(await res.json());
+    } catch (e) { setSrc({ error: e.message }); }
+    finally { setLoading(false); }
+  };
+  useEffect(() => { load(); }, []);
+  const dot = (ok) => <span className="fec-dot" style={{ background: ok ? "#8A9A5B" : "#B85B5B" }} />;
+  const when = (t) => (t ? timeAgo(t) : "—");
+  const VERDICT_COLOR = { "up to date": "var(--olive)", "new data available": "var(--brass)", "not downloaded": "var(--muted)", unreachable: "var(--rose)" };
+  return (
+    <div style={{ borderTop: "1px dashed var(--line)", marginTop: 14, paddingTop: 12 }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 8 }}>
+        <span style={{ fontSize: 10, color: "var(--muted)", letterSpacing: ".1em", textTransform: "uppercase" }}>Connections & data sources</span>
+        <button className="fec-btn ghost sm" onClick={() => load(true)} disabled={loading}
+          title="Re-check every source now (bypasses the 10-minute status cache)">
+          {loading ? "Checking…" : "↺ Re-check"}
+        </button>
+        {src?.cachedAt && <span className="sub" style={{ fontSize: 10 }}>checked {timeAgo(src.cachedAt)}</span>}
+      </div>
+      {src?.error && <div className="fec-error" role="alert">{src.error}</div>}
+      {src && !src.error && (
+        <>
+          <div style={{ display: "flex", gap: 18, flexWrap: "wrap", fontSize: 12, marginBottom: 10 }}>
+            <span>{dot(true)} FEC API — {src.fec?.keyConfigured ? "custom key" : <b style={{ color: "var(--brass)" }}>DEMO_KEY (set FEC_API_KEY)</b>}</span>
+            <span>
+              {dot(src.tn?.status === "ok")} TN TREF — {src.tn?.status === "ok" ? "reachable"
+                : src.tn?.status === "degraded" ? `degraded (HTTP ${src.tn?.httpStatus})`
+                : (src.tn?.error || "unreachable")}
+            </span>
+            <span>{dot(!!src.search?.configured)} web search — {src.search?.configured ? src.search.provider : "off (local only)"}</span>
+          </div>
+          <div className="fec-table-wrap">
+            <table className="fec-table">
+              <thead>
+                <tr><th>Bulk file</th><th>Cycle</th><th>FEC last updated</th><th>Local copy</th><th>Status</th></tr>
+              </thead>
+              <tbody>
+                {(src.bulk || []).map((b) => (
+                  <tr key={`${b.kind}${b.cycle}`}>
+                    <td>
+                      <a className="fec-extlink" href={safeUrl(b.url)} target="_blank" rel="noopener noreferrer"
+                        title={b.url}>{b.kind}{String(b.cycle).slice(2)}.zip ↗</a>
+                      <span className="sub" style={{ marginLeft: 8 }}>
+                        {{ cm: "committee master", cn: "candidate master", ccl: "linkages", pas2: "PAC→candidate", oth: "PAC→PAC" }[b.kind] || ""}
+                      </span>
+                    </td>
+                    <td className="sub">{b.cycle}</td>
+                    <td className="sub">{b.remote?.lastModified ? `${when(b.remote.lastModified)}${b.remote.size ? ` · ${(b.remote.size / 1e6).toFixed(1)} MB` : ""}` : (b.error || "—")}</td>
+                    <td className="sub">{b.local ? `downloaded ${when(b.local.mtime)}` : "—"}</td>
+                    <td><b style={{ color: VERDICT_COLOR[b.verdict] || "var(--muted)" }}>{b.verdict}</b></td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          <div className="sub" style={{ marginTop: 6, fontSize: 10.5 }}>
+            "new data available" = the FEC regenerated the file since your last download — run the bulk import below to pick it up.
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
+// ---- Admin: FEC bulk import (nationwide PAC layer) — run now, schedule, last/next status ----
+// The import runs server-side detached from this page (closing the browser doesn't kill it);
+// this section just polls /api/admin/bulk-import (3s while running, 20s idle).
+function BulkImportSection() {
+  const [st, setSt] = useState(null); // GET /api/admin/bulk-import payload
+  const [cyclesIn, setCyclesIn] = useState("");
+  const [othIn, setOthIn] = useState(true);
+  const [schedOn, setSchedOn] = useState(false);
+  const [schedHours, setSchedHours] = useState(168);
+  const [msg, setMsg] = useState(null);
+  const firstRef = useRef(true);
+
+  useEffect(() => {
+    let timer, dead = false;
+    const tick = async () => {
+      try {
+        const res = await fetch("/api/admin/bulk-import");
+        const d = await res.json();
+        if (dead) return;
+        setSt(d);
+        if (firstRef.current && d?.schedule) { // seed inputs from saved schedule once
+          firstRef.current = false;
+          setCyclesIn((d.schedule.cycles || []).join(","));
+          setOthIn(d.schedule.oth !== false);
+          setSchedOn(!!d.schedule.enabled);
+          setSchedHours(d.schedule.everyHours || 168);
+        }
+        timer = setTimeout(tick, d?.running ? 3000 : 20000);
+      } catch { if (!dead) timer = setTimeout(tick, 20000); }
+    };
+    tick();
+    return () => { dead = true; clearTimeout(timer); };
+  }, []);
+
+  const runNow = async () => {
+    setMsg(null);
+    try {
+      const res = await fetch("/api/admin/bulk-import", {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ cycles: cyclesIn, oth: othIn }),
+      });
+      const d = await res.json().catch(() => null);
+      if (!res.ok) throw new Error(d?.error?.message || `HTTP ${res.status}`);
+      setSt((s) => ({ ...(s || {}), running: true, log: [] }));
+      setMsg("Import started — safe to close this page.");
+    } catch (e) { setMsg(`Failed: ${e.message}`); }
+  };
+
+  const saveSchedule = async (enabled) => {
+    setMsg(null);
+    try {
+      const res = await fetch("/api/admin/bulk-schedule", {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ enabled, everyHours: schedHours, cycles: cyclesIn, oth: othIn }),
+      });
+      const d = await res.json().catch(() => null);
+      if (!res.ok) throw new Error(d?.error?.message || `HTTP ${res.status}`);
+      setSchedOn(enabled);
+      setSt((s) => (s ? { ...s, schedule: { ...s.schedule, ...d.schedule } } : s));
+      setMsg(enabled ? "Schedule saved." : "Schedule disabled.");
+    } catch (e) { setMsg(`Failed: ${e.message}`); }
+  };
+
+  const rel = (t) => {
+    if (!t) return "—";
+    const d = t - Date.now();
+    if (d <= 0) return "due now";
+    const h = Math.round(d / 3600000);
+    return h < 48 ? `in ~${h}h` : `in ~${Math.round(h / 24)}d`;
+  };
+  const last = st?.last;
+  const inputStyle = { background: "var(--ink)", color: "var(--bone)", border: "1px solid var(--line)", font: "inherit", fontSize: 12, padding: "3px 6px" };
+
+  return (
+    <div style={{ borderTop: "1px dashed var(--line)", marginTop: 14, paddingTop: 12 }}>
+      <div style={{ fontSize: 10, color: "var(--muted)", letterSpacing: ".1em", textTransform: "uppercase", marginBottom: 8 }}>
+        FEC bulk data — nationwide PAC layer
+      </div>
+      <div style={{ display: "flex", gap: 14, flexWrap: "wrap", fontSize: 12, marginBottom: 8, alignItems: "baseline" }}>
+        <span>
+          Last load:{" "}
+          {st?.running ? <b style={{ color: "var(--brass)" }}>⟳ importing now…</b>
+            : last ? (
+              <>
+                <b style={{ color: last.ok ? "var(--olive)" : "var(--rose)" }}>{last.ok ? "✓ ok" : "✕ failed"}</b>
+                {" "}<span className="sub">{timeAgo(last.at)} · cycles {(last.cycles || []).join(", ")}{last.oth ? " +oth" : ""} · {last.seconds}s · {last.trigger}</span>
+                {!last.ok && last.error ? <span style={{ color: "var(--rose)" }}> · {last.error}</span> : null}
+              </>
+            ) : <span className="sub">never</span>}
+        </span>
+        <span>
+          Next scheduled:{" "}
+          {st?.schedule?.enabled && st.schedule.nextAt
+            ? <><b style={{ color: "var(--brass)" }}>{new Date(st.schedule.nextAt).toLocaleString()}</b> <span className="sub">({rel(st.schedule.nextAt)}, every {st.schedule.everyHours}h)</span></>
+            : <span className="sub">off</span>}
+        </span>
+        {st?.stats && (
+          <span className="sub">
+            ledger {Number(st.stats.rows || 0).toLocaleString()} rows · {Number(st.stats.committees || 0).toLocaleString()} committees · {Number(st.stats.candidates || 0).toLocaleString()} candidates
+          </span>
+        )}
+      </div>
+      <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
+        <label className="fec-check" style={{ gap: 5 }} title={`"auto" always means the current cycle — a schedule saved as auto rolls over to new cycles by itself`}>
+          cycles
+          <input value={cyclesIn} onChange={(e) => setCyclesIn(e.target.value)} placeholder="auto,2024" style={{ ...inputStyle, width: 110 }} />
+        </label>
+        <label className="fec-check">
+          <input type="checkbox" checked={othIn} onChange={(e) => setOthIn(e.target.checked)} />
+          PAC→PAC (oth)
+        </label>
+        <button className="fec-btn ghost" style={{ fontSize: 11, padding: "3px 12px" }} onClick={runNow} disabled={st?.running}>
+          {st?.running ? "⟳ Importing…" : "⬇ Load bulk data now"}
+        </button>
+        <label className="fec-check" style={{ gap: 5 }}>
+          every
+          <select value={schedHours} onChange={(e) => setSchedHours(Number(e.target.value))} style={inputStyle}>
+            <option value={24}>day</option>
+            <option value={72}>3 days</option>
+            <option value={168}>week</option>
+            <option value={336}>2 weeks</option>
+          </select>
+        </label>
+        {schedOn
+          ? <>
+              <button className="fec-btn ghost" style={{ fontSize: 11, padding: "3px 12px" }} onClick={() => saveSchedule(true)}
+                title="Save cycles/interval changes to the schedule">✓ Save schedule</button>
+              <button className="fec-btn ghost" style={{ fontSize: 11, padding: "3px 12px" }} onClick={() => saveSchedule(false)}>■ Disable</button>
+            </>
+          : <button className="fec-btn ghost" style={{ fontSize: 11, padding: "3px 12px" }} onClick={() => saveSchedule(true)}>▶ Enable schedule</button>}
+        {msg && <span style={{ fontSize: 11, color: msg.startsWith("Failed") ? "var(--rose)" : "var(--olive)" }}>{msg}</span>}
+      </div>
+      {st?.running && (
+        <div style={{ background: "var(--ink)", border: "1px solid var(--line)", padding: "8px 10px", marginTop: 8,
+          fontFamily: "'IBM Plex Mono', monospace", fontSize: 10.5, whiteSpace: "pre-wrap", lineHeight: 1.5,
+          maxHeight: 160, overflowY: "auto" }}
+          ref={(el) => { if (el) el.scrollTop = el.scrollHeight; }}>
+          {(st.log || []).join("\n") || "Starting…"}<span className="fec-spin"> ▌</span>
+        </div>
+      )}
+      <div className="sub" style={{ marginTop: 6, fontSize: 10.5 }}>
+        Loads the FEC's nationwide bulk files (committee/candidate masters + every PAC→candidate contribution; +oth adds PAC→PAC transfers)
+        into the permanent ledger. Downloads cache in data/bulk and re-runs only re-read changed cycles' files. The import survives closing this page.
+      </div>
+    </div>
+  );
+}
+
 function AdminPanel({ onClose, onMembersRefreshed }) {
   const [status, setStatus] = useState(null);
   const [statusLoading, setStatusLoading] = useState(true);
@@ -6448,6 +6962,17 @@ function AdminPanel({ onClose, onMembersRefreshed }) {
     } catch { /* next health poll corrects */ }
   };
 
+  const [narrSaved, setNarrSaved] = useState(false);
+  const changeNarrModel = async (model) => { // moved here from the header — Admin owns model choice now
+    setOll((o) => ({ ...o, configuredModel: model, modelAvailable: (o?.models || []).includes(model) }));
+    try {
+      const res = await fetch("/api/settings/model", {
+        method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ model }),
+      });
+      if (res.ok) { setNarrSaved(true); setTimeout(() => setNarrSaved(false), 2500); }
+    } catch { /* next health poll corrects */ }
+  };
+
   useEffect(() => { loadStatus(); }, []);
 
   const runScript = () => {
@@ -6471,6 +6996,33 @@ function AdminPanel({ onClose, onMembersRefreshed }) {
       setScriptRunning(false);
       setScriptLog((s) => (s || "") + "\n[Connection closed]");
     };
+  };
+
+  const [backingUp, setBackingUp] = useState(false);
+  const [backupMsg, setBackupMsg] = useState(null);
+  const runBackup = async () => {
+    setBackingUp(true); setBackupMsg(null);
+    try {
+      const res = await fetch("/api/admin/backup", { method: "POST" });
+      const d = await res.json().catch(() => null);
+      if (!res.ok) throw new Error(d?.error?.message || `HTTP ${res.status}`);
+      setBackupMsg(`Saved data/backups/${d.file} (${(d.bytes / 1e6).toFixed(1)} MB) — ${d.backups.length} backup${d.backups.length === 1 ? "" : "s"} kept`);
+    } catch (e) { setBackupMsg(`Backup failed: ${e.message}`); }
+    finally { setBackingUp(false); }
+  };
+
+  const [compacting, setCompacting] = useState(false);
+  const compactDb = async () => {
+    if (!window.confirm("Compact the database now? The app pauses while the file is rewritten (seconds to a minute on a large store).")) return;
+    setCompacting(true); setBackupMsg(null);
+    try {
+      const res = await fetch("/api/admin/compact", { method: "POST" });
+      const d = await res.json().catch(() => null);
+      if (!res.ok) throw new Error(d?.error?.message || `HTTP ${res.status}`);
+      setBackupMsg(`Compacted: ${(d.beforeBytes / 1e6).toFixed(1)} MB → ${(d.afterBytes / 1e6).toFixed(1)} MB`);
+      await loadStatus();
+    } catch (e) { setBackupMsg(`Backup failed: compact — ${e.message}`); }
+    finally { setCompacting(false); }
   };
 
   const clearCache = async () => {
@@ -6527,8 +7079,18 @@ function AdminPanel({ onClose, onMembersRefreshed }) {
             {membersRefreshing ? "Refreshing…" : "⟳ Refresh Map Colors"}
           </button>
           <button className="fec-btn ghost" style={{ fontSize: 11, padding: "3px 12px" }}
+            onClick={runBackup} disabled={backingUp}
+            title="WAL-checkpoint + timestamped copy of the whole database into data/backups">
+            {backingUp ? "Backing up…" : "💾 Backup DB"}
+          </button>
+          <button className="fec-btn ghost" style={{ fontSize: 11, padding: "3px 12px" }}
             onClick={clearCache} disabled={cacheClearing}>
             {cacheClearing ? "Clearing…" : "🗑 Clear Cache"}
+          </button>
+          <button className="fec-btn ghost" style={{ fontSize: 11, padding: "3px 12px" }}
+            onClick={compactDb} disabled={compacting}
+            title="Delete long-expired cache rows, reclaim free pages (VACUUM) and refresh query-planner statistics">
+            {compacting ? "Compacting…" : "⇲ Compact DB"}
           </button>
           <button className="fec-btn ghost" style={{ fontSize: 11, padding: "3px 12px" }}
             onClick={clearAi} disabled={aiClearing}
@@ -6540,6 +7102,7 @@ function AdminPanel({ onClose, onMembersRefreshed }) {
       </div>
 
       {membersMsg && <div style={{ fontSize: 11, color: membersMsg.startsWith("Failed") ? "var(--rose)" : "var(--olive)", marginBottom: 10 }}>{membersMsg}</div>}
+      {backupMsg && <div style={{ fontSize: 11, color: backupMsg.startsWith("Backup failed") ? "var(--rose)" : "var(--olive)", marginBottom: 10 }}>{backupMsg}</div>}
       {statusLoading && <span className="fec-spin" style={{ fontSize: 11 }}>Loading…</span>}
       {status && !statusLoading && (
         <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))", gap: 16, marginBottom: scriptLog != null ? 14 : 0 }}>
@@ -6548,12 +7111,47 @@ function AdminPanel({ onClose, onMembersRefreshed }) {
             <div style={{ fontSize: 13 }}>{status.cache?.count ?? "—"} entries</div>
             <div style={{ fontSize: 11, color: "var(--muted)" }}>DB: {fmtBytes(status.cache?.dbSizeBytes)}</div>
             <div style={{ fontSize: 11, color: "var(--muted)" }}>{status.persistent ? "SQLite" : "In-memory"}</div>
+            {status.storage && (
+              <div style={{ fontSize: 11, color: "var(--muted)" }}
+                title={`Expired responses are kept ${status.storage.staleGraceDays} days as a fallback for when the FEC or TREF is down`}>
+                + {status.storage.cacheStale} stale fallback · {fmtBytes(status.storage.reclaimableBytes)} reclaimable
+              </div>
+            )}
           </div>
+          {status.fecGateway && (
+            <div>
+              <div style={{ fontSize: 10, color: "var(--muted)", letterSpacing: ".1em", textTransform: "uppercase", marginBottom: 4 }}>FEC calls saved</div>
+              <div style={{ fontSize: 13 }}>
+                {(() => { const g = status.fecGateway; const t = g.hits + g.misses + g.stale + g.coalesced; return t ? `${Math.round(((t - g.misses) / t) * 100)}% from cache` : "no calls yet"; })()}
+              </div>
+              <div style={{ fontSize: 11, color: "var(--muted)" }}>{status.fecGateway.misses} live · {status.fecGateway.hits} cached · {status.fecGateway.coalesced} merged</div>
+              <div style={{ fontSize: 11, color: status.fecGateway.blockedForSec ? "var(--rose)" : "var(--muted)" }}>
+                {status.fecGateway.blockedForSec ? `rate-limited — resumes in ${status.fecGateway.blockedForSec}s` : `${status.fecGateway.stale} served stale on upstream errors`}
+              </div>
+            </div>
+          )}
           <div>
             <div style={{ fontSize: 10, color: "var(--muted)", letterSpacing: ".1em", textTransform: "uppercase", marginBottom: 4 }}>AI Summaries</div>
             <div style={{ fontSize: 13 }}>{status.ai?.count ?? "—"} stored</div>
             <div style={{ fontSize: 11, color: "var(--muted)" }}>TN reports: {status.tnReports ?? "—"}</div>
             <div style={{ fontSize: 11, color: "var(--muted)" }}>refreshable per-item</div>
+          </div>
+          <div>
+            <div style={{ fontSize: 10, color: "var(--muted)", letterSpacing: ".1em", textTransform: "uppercase", marginBottom: 4 }}>Narrative AI</div>
+            {oll?.status === "ok" ? (
+              <>
+                <select className="fec-modelsel" value={oll.configuredModel || ""} onChange={(e) => changeNarrModel(e.target.value)}
+                  aria-label="Narrative AI model" title="Model for donor analyses, profiles, dossier narratives (saved permanently)" style={{ maxWidth: 150 }}>
+                  {[...new Set([oll.configuredModel, ...(oll.models || [])])].filter(Boolean).map((m) => (
+                    <option key={m} value={m}>{m}</option>
+                  ))}
+                </select>
+                <div style={{ fontSize: 11, color: oll.modelAvailable === false ? "#C8723A" : "var(--muted)" }}>
+                  {oll.modelAvailable === false ? "not pulled — run ollama pull" : "narrative model"}
+                  {narrSaved && <span style={{ color: "var(--olive)" }}> saved ✓</span>}
+                </div>
+              </>
+            ) : <div style={{ fontSize: 13, color: "var(--rose)" }}>ollama offline</div>}
           </div>
           <div>
             <div style={{ fontSize: 10, color: "var(--muted)", letterSpacing: ".1em", textTransform: "uppercase", marginBottom: 4 }}>Ask AI agent</div>
@@ -6604,6 +7202,9 @@ function AdminPanel({ onClose, onMembersRefreshed }) {
           {scriptRunning && <span className="fec-spin"> ▌</span>}
         </div>
       )}
+
+      <ConnectionsSection />
+      <BulkImportSection />
     </div>
   );
 }
@@ -6759,7 +7360,7 @@ function AskAI({ candidateId, committeeId, name, party, state, office, cycle, se
 // ---------- Dossier: inline on-screen rendering ----------
 function DossierSec({ title, children }) {
   return <div style={{ marginTop: 18 }}>
-    <h3 style={{ fontFamily: "'Barlow Condensed', sans-serif", fontSize: 16, color: "var(--brass)", textTransform: "uppercase", letterSpacing: ".06em", borderTop: "1px solid var(--line)", paddingTop: 10, margin: "0 0 8px" }}>{title}</h3>
+    <h3 style={{ fontFamily: "'IBM Plex Sans Condensed', sans-serif", fontSize: 16, color: "var(--brass)", textTransform: "uppercase", letterSpacing: ".06em", borderTop: "1px solid var(--line)", paddingTop: 10, margin: "0 0 8px" }}>{title}</h3>
     {children}
   </div>;
 }
@@ -6816,6 +7417,11 @@ function DossierBody({ d }) {
           <thead><tr><th>Vendor</th><th>Payments</th><th className="amt">Total</th></tr></thead>
           <tbody>{m.topVendors.map((x, i) => <tr key={i}><td>{x.name}</td><td>{x.count}</td><td className="amt">{fmtUSD(x.amount)}</td></tr>)}</tbody>
         </table></div>}
+        {(m.topDonors?.length > 0 || m.topVendors?.length > 0) && <>
+          <div className="fec-ai-label" style={{ marginTop: 12 }}>Money flow map</div>
+          <div className="fec-flow-scroll" style={{ minWidth: 0 }}
+            dangerouslySetInnerHTML={{ __html: _flowBubblesHTML(d.entity.name, m.topDonors, m.topVendors, { dark: true }) }} />
+        </>}
       </DossierSec> : d.moneyError ? <DossierSec title="Money flows"><div className="sub">Money flows unavailable: {d.moneyError}</div></DossierSec> : null}
       <DossierSec title="Background & profile (AI web research)">
         {d.research?.available
@@ -6853,6 +7459,11 @@ function DossierBody({ d }) {
       {d.spending.analysis && <div className="fec-ai-text">{d.spending.analysis}</div>}
       <div className="fec-table-wrap" style={{ marginTop: 8 }}><table className="fec-table"><thead><tr><th>Recipient</th><th className="amt">Amount</th></tr></thead>
         <tbody>{d.spending.top_recipients.slice(0, 10).map((r, i) => <tr key={i}><td>{r.name}</td><td className="amt">{fmtUSD(r.amount)}</td></tr>)}</tbody></table></div>
+    </DossierSec>}
+    {(dn?.topDonors?.length > 0 || d.spending?.top_recipients?.length > 0) && <DossierSec title="Money flow map">
+      <div className="sub">Largest itemized donors (left) and largest expenditure recipients (right) — bubble size scales with dollars.</div>
+      <div className="fec-flow-scroll" style={{ minWidth: 0, marginTop: 8 }}
+        dangerouslySetInnerHTML={{ __html: _flowBubblesHTML(d.candidate.name, dn?.topDonors, d.spending?.top_recipients, { dark: true }) }} />
     </DossierSec>}
     {d.outside && (d.outside.total_spent_FOR_candidate || d.outside.total_spent_AGAINST_candidate)
       ? <DossierSec title="Outside money (Schedule E)">
@@ -6920,7 +7531,7 @@ function DossierModal({ dossier, cached, mapHtml, onClose, onRebuild }) {
     font-family:'IBM Plex Mono', ui-monospace, Menlo, monospace; font-size:12px; line-height:1.5;
     padding:22px 26px; max-width:980px; margin:0 auto;
   }
-  .fec-print-wrap h1 { font-family:'Barlow Condensed', sans-serif; font-weight:700; font-size:26px; margin:0 0 4px; color:#15170F; text-transform:uppercase; letter-spacing:.02em; }
+  .fec-print-wrap h1 { font-family:'IBM Plex Sans Condensed', sans-serif; font-weight:700; font-size:26px; margin:0 0 4px; color:#15170F; text-transform:uppercase; letter-spacing:.02em; }
   .fec-print-wrap .meta { color:#666; font-size:11px; margin-bottom:16px; }
   .fec-print-wrap .fec-table th { background:#EEF1E8 !important; color:#444 !important; border-bottom:2px solid #bbb !important; }
   .fec-print-wrap .fec-table td { border-bottom:1px solid #E2E2D8 !important; }
@@ -7047,10 +7658,27 @@ export default function App() {
   const [district, setDistrict] = useState("01");
   const [party, setParty] = useState("");
   const [hidePaper, setHidePaper] = useState(true);
-  const [view, setView] = useState("money");
+  const [view, setViewRaw] = useState("money");
+  // Donors and Tennessee stay mounted once opened, so switching tabs no longer throws away a
+  // search in progress (and no longer re-fetches everything when you come back).
+  const [visited, setVisited] = useState({});
+  const setView = (v) => { setViewRaw(v); setVisited((p) => (p[v] ? p : { ...p, [v]: true })); };
+  const [theme, setTheme] = useState(() => { try { return localStorage.getItem("fec-theme") || ""; } catch { return ""; } });
+  useEffect(() => {
+    if (theme) document.documentElement.dataset.theme = theme; else delete document.documentElement.dataset.theme;
+    try { if (theme) localStorage.setItem("fec-theme", theme); else localStorage.removeItem("fec-theme"); } catch { /* private mode */ }
+  }, [theme]);
+  const isLight = theme ? theme === "light" : (typeof matchMedia !== "undefined" && matchMedia("(prefers-color-scheme: light)").matches);
   const [tnSeed, setTnSeed] = useState(null); // Donors-tab drill-through: {name, t} → TN entity search
+  const [donorSeed, setDonorSeed] = useState(null); // ledger drill-through: {name, t} → Donors-tab search
+  const jumpToDonor = (nm) => { setDonorSeed({ name: nm, t: Date.now() }); setView("donors"); };
 
   const [showAdmin, setShowAdmin] = useState(false);
+  const [showAlerts, setShowAlerts] = useState(false);
+  const [alertCount, setAlertCount] = useState(0);
+  useEffect(() => { // badge on load without opening the panel
+    fetch("/api/alerts").then((r) => r.json()).then((d) => setAlertCount(d.unseen || 0)).catch(() => {});
+  }, []);
   const [memberRefreshKey, setMemberRefreshKey] = useState(0);
   const [health, setHealth] = useState(null);
   const [ollama, setOllama] = useState(null);
@@ -7087,6 +7715,55 @@ export default function App() {
   const [patternOpen, setPatternOpen] = useState({}); // candidateId → {committeeId} | {loading:true} (timing clusters)
   const [compareSel, setCompareSel] = useState({}); // candidateId → target for ⇄ shared-donor comparison
   const [overlap, setOverlap] = useState(null); // null | {loading} | {data, allCycles} | {error}
+  const [candWatch, setCandWatch] = useState({ loading: true, candidates: [] }); // tracked federal candidates
+  const [cwOverride, setCwOverride] = useState({}); // candId -> bool, optimistic
+  const [cwRefreshing, setCwRefreshing] = useState(false);
+  const [candSeek, setCandSeek] = useState(null); // set after filter changes → auto-runs searchMoney
+  const [candTrends, setCandTrends] = useState({}); // candId -> filing-period totals (sparklines)
+
+  const loadCandWatch = async () => {
+    try {
+      const res = await fetch("/api/candidates/watchlist");
+      const data = await res.json().catch(() => null);
+      if (res.ok) { setCandWatch({ candidates: data?.candidates || [] }); setCwOverride({}); }
+    } catch { /* section renders from last state */ }
+  };
+  useEffect(() => { loadCandWatch(); }, []);
+  const cwIds = new Set((candWatch.candidates || []).map((w) => w.candId));
+  const cwHas = (id) => (cwOverride[id] != null ? cwOverride[id] : cwIds.has(id));
+  const trackCand = async (r) => {
+    const cid = r.candidate_id;
+    try {
+      await fetch("/api/candidates/watch", { method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ candId: cid, name: r.candidate_name, party: r.party_full || "",
+          state: office === "P" ? "" : state, office, district: office === "H" ? district : "", pcc: r.candidate_pcc_id || "" }) });
+      setCwOverride((p) => ({ ...p, [cid]: true }));
+      loadCandWatch();
+    } catch { /* best-effort */ }
+  };
+  const untrackCand = async (cid) => {
+    try { await fetch(`/api/candidates/watch?id=${encodeURIComponent(cid)}`, { method: "DELETE" }); } catch { /* reload corrects */ }
+    setCwOverride((p) => ({ ...p, [cid]: false }));
+    loadCandWatch();
+  };
+  const openTrackedCand = (w) => {
+    if (w.office) setOffice(w.office);
+    if (w.office !== "P" && w.state) setState(w.state);
+    if (w.office === "H" && w.district) setDistrict(String(w.district).padStart(2, "0"));
+    setView("money");
+    fetch("/api/candidates/watch/seen", { method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ candId: w.candId }) }).then(() => loadCandWatch()).catch(() => { /* badge clears later */ });
+    setCandSeek(Date.now()); // filters just changed — the effect below runs the search once they settle
+  };
+  const refreshCandWatch = async () => {
+    setCwRefreshing(true);
+    try {
+      const res = await fetch("/api/candidates/watchlist/refresh", { method: "POST" });
+      const data = await res.json().catch(() => null);
+      if (res.ok && data?.candidates) setCandWatch({ candidates: data.candidates });
+    } finally { setCwRefreshing(false); }
+  };
+  // (candSeek + trends effects live below searchMoney's definition — it's a const, TDZ applies)
 
   const closeLedger = (candidateId) =>
     setOpenLedgers((prev) => { const n = { ...prev }; delete n[candidateId]; return n; });
@@ -7169,6 +7846,28 @@ export default function App() {
   }, [cycle, office, state, district, party, hidePaper]);
 
   const run = (forceRefresh = false) => (view === "money" ? searchMoney(forceRefresh) : searchField(1));
+
+  // Open ▸ on a tracked candidate: debounce until the filter state (and searchMoney's closure)
+  // has settled, then run the race search once.
+  useEffect(() => {
+    if (!candSeek) return;
+    const t = setTimeout(() => { setCandSeek(null); searchMoney(); }, 60);
+    return () => clearTimeout(t);
+  }, [candSeek, searchMoney]);
+
+  // sparkline feed: filing-period totals for the visible race (accrues from every pull)
+  useEffect(() => {
+    if (!race?.length) { setCandTrends({}); return; }
+    let live = true;
+    (async () => {
+      try {
+        const ids = race.map((r) => r.candidate_id).join(",");
+        const d = await fetch(`/api/candidates/trends?ids=${encodeURIComponent(ids)}`).then((r) => r.json());
+        if (live) setCandTrends(d?.trends || {});
+      } catch { /* sparklines just don't render */ }
+    })();
+    return () => { live = false; };
+  }, [race]);
 
   const toggleTotals = async (cid) => {
     const nowOpen = !open[cid];
@@ -7311,52 +8010,55 @@ export default function App() {
   return (
     <div className="fec-root">
       <style>{css}</style>
+      <header className="app-bar">
+        <div className="app-bar-in">
+          <a className="app-brand" href="/" onClick={(e) => { e.preventDefault(); setView("money"); }} title="FEC Records Terminal">
+            <svg className="app-mark" viewBox="0 0 26 26" aria-hidden="true">
+              <rect x="1" y="1" width="24" height="24" rx="6" fill="var(--brass)" />
+              <path d="M7 18.5V7.5h9.5M7 13h7.5M19.5 12v7M16.8 16.3l2.7 2.7 2.7-2.7" fill="none" stroke="var(--brass-ink)" strokeWidth="2.1" strokeLinecap="round" strokeLinejoin="round" />
+            </svg>
+            <span><b>Records Terminal</b><small>FEC and Tennessee campaign money</small></span>
+          </a>
+          <nav className="app-nav" role="tablist" aria-label="Sections">
+            <button role="tab" aria-selected={view === "money"} onClick={() => setView("money")}>Money race</button>
+            <button role="tab" aria-selected={view === "field"} onClick={() => setView("field")}>The field</button>
+            <button role="tab" aria-selected={view === "donors"} onClick={() => setView("donors")}>Donors</button>
+            <button role="tab" aria-selected={view === "tn"} onClick={() => setView("tn")}>Tennessee</button>
+          </nav>
+          <div className="app-tools">
+            <span className="status-pill" title={health?.status === "ok"
+              ? `FEC proxy online · ${health.keyConfigured ? "custom key" : "DEMO_KEY — set FEC_API_KEY"} — details in Admin`
+              : "FEC proxy unreachable — details in Admin"}>
+              <span className="fec-dot" style={{ background: health?.status === "ok" ? "var(--olive)" : "var(--rose)" }} /><span className="lbl">FEC</span>
+            </span>
+            <span className="status-pill" title={ollama?.status === "ok"
+              ? `Ollama online · ${ollama.configuredModel || ""} — change models in Admin`
+              : "Ollama offline — AI analysis disabled"}>
+              <span className="fec-dot" style={{ background: ollama?.status === "ok" ? "var(--olive)" : "var(--muted)" }} /><span className="lbl">AI</span>
+            </span>
+            <button className={`icon-btn${alertCount ? " on" : ""}`} onClick={() => setShowAlerts((v) => !v)}
+              aria-label={alertCount ? `Alerts, ${alertCount} new` : "Alerts"} title="Alerts">🔔{alertCount ? ` ${alertCount}` : ""}</button>
+            <button className="icon-btn" onClick={() => setTheme(isLight ? "dark" : "light")}
+              aria-label={isLight ? "Switch to dark theme" : "Switch to light theme"} title={isLight ? "Dark theme" : "Light theme"}>{isLight ? "☾" : "☀"}</button>
+            <button className={`icon-btn${showAdmin ? " on" : ""}`} onClick={() => setShowAdmin((v) => !v)} title="Status, data sources, models, storage">⚙ Admin</button>
+          </div>
+        </div>
+      </header>
       <div className="fec-wrap">
-        <header className="fec-head">
-          <div>
-            <div className="fec-eyebrow">Federal Election Commission · OpenFEC v1</div>
-            <h1 className="fec-title">Candidate <em>Records</em> Terminal</h1>
-            <p className="fec-sub">Live queries against the FEC candidate file. Follow the money down to individual checks.</p>
-          </div>
-          <div className="fec-health">
-            <div>
-              <button
-                onClick={() => setShowAdmin((v) => !v)}
-                style={{ background: "none", border: "1px solid var(--line)", color: "var(--muted)", fontSize: 10,
-                  padding: "2px 8px", cursor: "pointer", letterSpacing: ".08em", fontFamily: "inherit" }}
-              >⚙ Admin</button>
-            </div>
-            <div>
-              <span className="fec-dot" style={{ background: health?.status === "ok" ? "#8A9A5B" : "#B85B5B" }} />
-              {health?.status === "ok"
-                ? `proxy online · ${health.keyConfigured ? "custom key" : "DEMO_KEY (set FEC_API_KEY)"}`
-                : "proxy unreachable"}
-            </div>
-            <div>
-              <span className="fec-dot" style={{ background: ollama?.status === "ok" ? "#8A9A5B" : "#6B7257" }} />
-              {ollama?.status === "ok" ? (
-                <>
-                  ollama online ·{" "}
-                  <select
-                    className="fec-modelsel"
-                    value={ollama.configuredModel}
-                    onChange={(e) => changeModel(e.target.value)}
-                    aria-label="AI model (saved permanently)"
-                    title="AI model — choice is saved permanently"
-                  >
-                    {[...new Set([ollama.configuredModel, ...(ollama.models || [])])].map((m) => (
-                      <option key={m} value={m}>{m}</option>
-                    ))}
-                  </select>
-                  {ollama.modelAvailable === false ? " (not pulled!)" : ""}
-                  {modelSaved && <span style={{ color: "var(--olive)" }}> saved ✓</span>}
-                </>
-              ) : "ollama offline — AI analysis disabled"}
-            </div>
-          </div>
-        </header>
 
         {showAdmin && <AdminPanel onClose={() => setShowAdmin(false)} onMembersRefreshed={() => setMemberRefreshKey((k) => k + 1)} />}
+        {showAlerts && <AlertsPanel onClose={() => setShowAlerts(false)} onCount={setAlertCount} />}
+
+        <QuickFind
+          onRace={(c) => {
+            if (c.office) setOffice(c.office);
+            if (c.office !== "P" && c.state) setState(c.state);
+            if (c.office === "H" && c.district) setDistrict(String(c.district).padStart(2, "0"));
+            setView("money");
+            setCandSeek(Date.now());
+          }}
+          onDonorsTab={() => setView("donors")}
+        />
 
         <section className="fec-controls" aria-label="Search filters" style={{ display: view === "tn" || view === "donors" ? "none" : undefined }}>
           <div className="fec-field">
@@ -7415,21 +8117,74 @@ export default function App() {
           />
         )}
 
-        <div className="fec-tabs" role="tablist">
-          <button className="fec-tab" role="tab" aria-selected={view === "money"} onClick={() => setView("money")}>Money Race</button>
-          <button className="fec-tab" role="tab" aria-selected={view === "field"} onClick={() => setView("field")}>The Field</button>
-          <button className="fec-tab" role="tab" aria-selected={view === "donors"} onClick={() => setView("donors")}>Donors</button>
-          <button className="fec-tab" role="tab" aria-selected={view === "tn"} onClick={() => setView("tn")}>TN State</button>
-        </div>
+        {visited.tn && (
+          <div style={{ display: view === "tn" ? undefined : "none" }}>
+            <TennesseeHub
+              seed={tnSeed}
+              registry={<TnPanel seed={tnSeed} />}
+              onOpenEntity={(name) => setTnSeed({ name, t: Date.now() })}
+              onOpenDonor={jumpToDonor}
+              onOpenRace={({ office: o, district: d, cycle: cy }) => {
+                setOffice(o); setState("TN"); if (cy) setCycle(cy);
+                if (o === "H" && d) setDistrict(String(d).padStart(2, "0"));
+                setView("money");
+                setCandSeek(Date.now());
+              }}
+            />
+          </div>
+        )}
 
-        {view === "tn" && <TnPanel seed={tnSeed} />}
-
-        {view === "donors" && (
-          <DonorsPanel onDrillTn={(name) => { setTnSeed({ name, t: Date.now() }); setView("tn"); }} />
+        {visited.donors && (
+          <div style={{ display: view === "donors" ? undefined : "none" }}>
+            <DonorsPanel seed={donorSeed} onDrillTn={(name) => { setTnSeed({ name, t: Date.now() }); setView("tn"); }} />
+          </div>
         )}
 
         {view !== "tn" && view !== "donors" && error && <div className="fec-error" role="alert">{error}</div>}
 
+
+        {/* ---------- tracked federal candidates ---------- */}
+        {view === "money" && (candWatch.candidates || []).length > 0 && (
+          <section className="fec-controls" style={{ marginTop: 16, display: "block" }} aria-label="Tracked candidates">
+            <div style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
+              <span className="fec-ai-label" style={{ marginBottom: 0 }}>Tracked candidates</span>
+              <span style={{ marginLeft: "auto" }}>
+                <button className="fec-btn ghost sm" onClick={refreshCandWatch} disabled={cwRefreshing}
+                  title="Pull fresh totals + top receipts for every tracked candidate">
+                  {cwRefreshing ? "Checking…" : "↺ Check all tracked"}
+                </button>
+              </span>
+            </div>
+            <div className="fec-table-wrap" style={{ marginTop: 10 }}>
+              <table className="fec-table">
+                <thead><tr><th>Candidate</th><th>Race</th><th className="amt">Latest receipts</th><th>Changes</th><th aria-label="Actions" /></tr></thead>
+                <tbody>
+                  {candWatch.candidates.map((w) => (
+                    <tr key={w.candId}>
+                      <td><b style={{ color: "var(--bone)" }}>{w.name}</b><div className="sub">{w.party || "—"}</div></td>
+                      <td className="sub">{w.office === "P" ? "President" : w.office === "S" ? `${w.state} Senate` : `${w.state}-${w.district || "?"}`}</td>
+                      <td className="amt">
+                        {w.latest ? fmtUSDshort(w.latest.receipts || 0) : "—"}
+                        {w.latest?.coverageEnd && <div className="sub">thru {w.latest.coverageEnd}</div>}
+                      </td>
+                      <td>
+                        {w.deltaReceipts > 0 && <div style={{ color: "var(--brass)", fontWeight: 700 }}>▲ +{fmtUSDshort(w.deltaReceipts)} since last look</div>}
+                        {w.newRows > 0 && <div style={{ color: "var(--brass)" }}>▲ {w.newRows} new gift{w.newRows === 1 ? "" : "s"} stored</div>}
+                        {!(w.deltaReceipts > 0) && !(w.newRows > 0) && <span className="sub">—</span>}
+                      </td>
+                      <td style={{ whiteSpace: "nowrap", textAlign: "right" }}>
+                        <button className="fec-btn ghost sm" onClick={() => openTrackedCand(w)}
+                          title="Load this candidate's race (marks changes as seen)">Open ▸</button>
+                        {" "}
+                        <button className="fec-btn ghost sm" onClick={() => untrackCand(w.candId)} title="Stop tracking">✕</button>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </section>
+        )}
 
         {/* ---------- MONEY RACE ---------- */}
         {view === "money" && race && !error && (
@@ -7474,6 +8229,7 @@ export default function App() {
                   <div className="fec-race-row" style={{ "--pc": partyColor(r.party_full) }}>
                     <div className="fec-race-name">
                       {r.candidate_name}
+                      {candTrends[cid]?.length > 1 && <span style={{ marginLeft: 8, verticalAlign: "middle" }}><Spark points={candTrends[cid]} /></span>}
                       <small>{r.party_full || "—"} · {cid}{r.incumbent_challenge_full === "Incumbent" ? " · INC" : ""}
                         {" · "}<a href={`https://www.fec.gov/data/candidate/${cid}/`} target="_blank" rel="noopener noreferrer" className="fec-extlink" title="FEC filings for this candidate">FEC ↗</a>
                       </small>
@@ -7493,6 +8249,9 @@ export default function App() {
                       </div>
                     </div>
                     <div style={{ display: "flex", gap: 6, flexWrap: "wrap", justifyContent: "flex-end", alignItems: "center" }}>
+                      {cwHas(cid)
+                        ? <button className="fec-btn ghost sm" onClick={() => untrackCand(cid)} title="Stop tracking this candidate">★</button>
+                        : <button className="fec-btn ghost sm" onClick={() => trackCand(r)} title="Track — new filings and gifts get flagged at the top of this tab">☆</button>}
                       <label className="fec-check" style={{ fontSize: 12, gap: 4 }}
                         title="Select for ⇄ shared-donor comparison (pick 2-6 rows, then hit ⇄ Shared donors above)">
                         <input type="checkbox" checked={!!compareSel[cid]} onChange={() => toggleCompare(r)} />⇄
@@ -7547,6 +8306,7 @@ export default function App() {
                       cycle={cycle}
                       raceState={office === "P" ? "" : state}
                       onClose={() => closeLedger(cid)}
+                      onDonorInfo={jumpToDonor}
                     />
                   )}
                 </Fragment>
@@ -7636,6 +8396,7 @@ export default function App() {
                       cycle={cycle}
                       raceState={office === "P" ? "" : state}
                       onClose={() => closeLedger(cid)}
+                      onDonorInfo={jumpToDonor}
                     />
                   )}
                 </Fragment>
@@ -7654,6 +8415,11 @@ export default function App() {
         {view !== "tn" && view !== "donors" && !race && !candidates && !error && (
           <div className="fec-empty">Set your filters and pull records. Defaults are loaded for TN-01, 2026.</div>
         )}
+      </div>
+      <div style={{ position: "fixed", right: 10, bottom: 8, fontSize: 10, color: "var(--muted)",
+        opacity: 0.75, pointerEvents: "none", fontFamily: "var(--font-num)", zIndex: 5 }}
+        title="App version · build time">
+        v{typeof __APP_VERSION__ !== "undefined" ? __APP_VERSION__ : "dev"} · {typeof __BUILD_TIME__ !== "undefined" ? __BUILD_TIME__ : "dev build"}
       </div>
     </div>
   );
